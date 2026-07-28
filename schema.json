@@ -1,0 +1,38 @@
+{
+  "max_concurrent": {
+    "type": "integer",
+    "name": "Max Concurrent SubAgents",
+    "default": 3,
+    "hint": "Maximum number of sub-agents running at the same time",
+    "locales": {
+      "zh": { "name": "最大并发子代理数", "hint": "同时运行的子代理最大数量" }
+    }
+  },
+  "allowed_tools": {
+    "type": "string",
+    "name": "Allowed Tools",
+    "default": "read_file, write_file, search, extract_webpage",
+    "hint": "Comma-separated list of tool names available to sub-agents",
+    "locales": {
+      "zh": { "name": "可用工具列表", "hint": "子代理可用的工具名称，用英文逗号分隔" }
+    }
+  },
+  "allowed_read_paths": {
+    "type": "string",
+    "name": "Custom Read Paths",
+    "default": "data/files, data/temp, data/plugins",
+    "hint": "Comma-separated paths allowed for sub-agent file reading",
+    "locales": {
+      "zh": { "name": "自定义读取路径", "hint": "子代理可读取的路径，用英文逗号分隔" }
+    }
+  },
+  "allowed_write_paths": {
+    "type": "string",
+    "name": "Custom Write Paths",
+    "default": "data/files, data/temp",
+    "hint": "Comma-separated paths allowed for sub-agent file writing",
+    "locales": {
+      "zh": { "name": "自定义写入路径", "hint": "子代理可写入的路径，用英文逗号分隔" }
+    }
+  }
+}
