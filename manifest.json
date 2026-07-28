@@ -5,7 +5,7 @@
     "version": "0.1.0",
     "author": "Orion & 陈舒昕",
     "description": "Enables the main agent to delegate tasks to specialized sub-agents with their own persona and tools.",
-    "repo": null,
+    "repo": "https://github.com/Qixuan112/subagent-plugin",
     "tags": [
         "agent",
         "tools"
