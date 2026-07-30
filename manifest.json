@@ -5,7 +5,7 @@
     "version": "1.0.0",
     "author": "Orion & 陈舒昕 & znq19",
     "description": "Delegate tasks to specialized sub-agents with async dispatch, progress tracking, chat commands and webui persona integration.",
-    "repo": "https://github.com/Qixuan112/subagent-plugin",
+    "repo": "https://github.com/Qixuan112/KiraAI-subagent-plugin",
     "tags": [
         "agent",
         "tools"
