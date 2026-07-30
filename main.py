@@ -30,7 +30,7 @@ from core.utils.tool_utils import BaseTool
 from core.utils.path_utils import get_data_path
 from core.prompt_manager import Prompt
 from core.provider import LLMRequest
-from core.chat.session import Session
+from core.chat.session import Group, Session
 from core.chat.message_utils import KiraMessageBatchEvent, KiraMessageEvent, KiraIMMessage
 from core.chat import MessageChain
 from core.chat.message_elements import Text
@@ -966,10 +966,11 @@ class SubAgentPlugin(BasePlugin):
         session = Session(adapter_name=adapter_name, session_type=st, session_id=sess_id)
         # 放一条合成消息：框架的 ON_LLM_RESPONSE 钩子会把本事件广播给所有插件，
         # 不少插件直接访问 event.messages[-1]（如 is_group_message()），空列表会 IndexError
+        # 群会话带 Group，否则下游插件会把群来源任务误判成私聊走错分支
         dummy_msg = KiraIMMessage(
             message_id="subagent_stub", self_id="subagent",
             chain=MessageChain([]), timestamp=int(time.time()),
-            session=session, group=None,
+            session=session, group=Group(group_id=sess_id) if st == "gm" else None,
         )
         return KiraMessageBatchEvent(
             message_types=[],
