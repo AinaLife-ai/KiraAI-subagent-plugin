@@ -2,9 +2,9 @@
     "display_name": "SubAgent",
     "plugin_id": "subagent",
     "uninstallable": true,
-    "version": "0.1.0",
-    "author": "Orion & 陈舒昕",
-    "description": "Enables the main agent to delegate tasks to specialized sub-agents with their own persona and tools.",
+    "version": "1.0.0",
+    "author": "Orion & 陈舒昕 & znq19",
+    "description": "Delegate tasks to specialized sub-agents with async dispatch, progress tracking, chat commands and webui persona integration.",
     "repo": "https://github.com/Qixuan112/subagent-plugin",
     "tags": [
         "agent",
@@ -13,7 +13,7 @@
     "locales": {
         "zh": {
             "display_name": "子代理",
-            "description": "让主代理能够将任务委派给拥有独立角色设定和工具集的子代理"
+            "description": "把任务委派给专业子代理：异步派发不阻塞、进度可查可停可续、聊天命令直达、webui 人设集成"
         }
     }
 }

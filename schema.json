@@ -1,38 +1,799 @@
 {
-  "max_concurrent": {
-    "type": "integer",
-    "name": "Max Concurrent SubAgents",
-    "default": 3,
-    "hint": "Maximum number of sub-agents running at the same time",
+  "section_general": {
+    "type": "section",
+    "name": "General",
+    "hint": "Execution & delivery behavior",
     "locales": {
-      "zh": { "name": "最大并发子代理数", "hint": "同时运行的子代理最大数量" }
+      "zh": {
+        "name": "常规",
+        "hint": "执行与投递行为"
+      }
+    },
+    "fields": {
+      "enabled_sessions": {
+        "type": "list",
+        "name": "Enabled Sessions",
+        "default": [],
+        "hint": "Sessions where sub-agent features are enabled, format <adapter_name>:<gm/dm>:<session_id>. Empty = all sessions",
+        "locales": {
+          "zh": {
+            "name": "启用会话",
+            "hint": "启用子代理功能的会话名单，格式 <adapter>:<gm/dm>:<session_id>，留空=全部启用"
+          }
+        }
+      },
+      "call_mode": {
+        "type": "enum",
+        "name": "Call Mode",
+        "default": "async",
+        "options": [
+          "async",
+          "sync"
+        ],
+        "hint": "async: spawn runs in background and reports on completion (recommended); sync: call_subagent blocks until done",
+        "locales": {
+          "zh": {
+            "name": "调用模式",
+            "hint": "async=后台派发完成汇报（推荐）；sync=同步阻塞等待"
+          }
+        }
+      },
+      "result_delivery": {
+        "type": "enum",
+        "name": "Result Delivery",
+        "default": "to_main_llm",
+        "options": [
+          "to_main_llm",
+          "direct_send"
+        ],
+        "hint": "to_main_llm: result is injected into the session buffer (merging with pending messages when possible) so the main AI reports it proactively; direct_send: send result to user directly",
+        "locales": {
+          "zh": {
+            "name": "结果投递",
+            "hint": "to_main_llm=注入会话缓冲（尽量与待发消息合并）由主 AI 主动汇报；direct_send=直接发给用户"
+          }
+        }
+      },
+      "merge_window_ms": {
+        "type": "integer",
+        "name": "Merge Window (ms)",
+        "default": 100,
+        "hint": "Wait time before injecting the completion notice, to merge with pending user messages into one main-AI turn. 0 = inject immediately",
+        "locales": {
+          "zh": {
+            "name": "合并窗口(毫秒)",
+            "hint": "注入完成通知前的等待时间，提高与用户消息合并为一次主模型调用的概率。0=立即注入"
+          }
+        }
+      },
+      "max_concurrent": {
+        "type": "integer",
+        "name": "Max Concurrent (Global)",
+        "default": 10,
+        "hint": "Global limit of concurrently running sub-agents. Excess tasks queue up (status: queued)",
+        "locales": {
+          "zh": {
+            "name": "全局最大并发",
+            "hint": "所有会话合计的运行上限，超出排队（状态 queued）"
+          }
+        }
+      },
+      "max_concurrent_per_session": {
+        "type": "integer",
+        "name": "Max Concurrent Per Session",
+        "default": 5,
+        "hint": "Per-session limit. 0 = no per-session limit",
+        "locales": {
+          "zh": {
+            "name": "单会话最大并发",
+            "hint": "每个会话的运行上限，0=不限制"
+          }
+        }
+      },
+      "default_max_steps": {
+        "type": "integer",
+        "name": "Default Max Steps",
+        "default": 20,
+        "hint": "Default reasoning steps for sub-agents",
+        "locales": {
+          "zh": {
+            "name": "默认最大步数",
+            "hint": "子代理默认推理步数"
+          }
+        }
+      },
+      "min_llm_steps": {
+        "type": "integer",
+        "name": "Min LLM-set Steps",
+        "default": 15,
+        "minimum": 0,
+        "hint": "Floor for step counts set by the main AI (it tends to guess too small, e.g. 5). Values it provides below this are raised to this floor, then still capped by the hard limit. 0 = no floor. Only applies to AI-provided values; the plugin default and webui per-agent settings are not affected",
+        "locales": {
+          "zh": {
+            "name": "AI设置步数下限",
+            "hint": "主 AI 设置步数时的下限（它常保守地填 5 之类的小值，会被抬到此下限，再受硬上限约束）。0=不限制。仅约束 AI 主动给的值；插件默认值和你在 webui 给子代理手动配置的步数不受影响"
+          }
+        }
+      },
+      "max_steps_limit": {
+        "type": "integer",
+        "name": "Max Steps Limit",
+        "default": 25,
+        "hint": "Hard cap on sub-agent steps (user-level final control)",
+        "locales": {
+          "zh": {
+            "name": "步数硬上限",
+            "hint": "子代理步数的上限（用户最终控制权）"
+          }
+        }
+      },
+      "default_timeout": {
+        "type": "integer",
+        "name": "Default Timeout (s)",
+        "default": 300,
+        "hint": "Default total timeout per sub-agent task (each task times independently). Note: each individual tool call is separately capped by the webui 'tool call timeout' setting, not by this",
+        "locales": {
+          "zh": {
+            "name": "默认超时(秒)",
+            "hint": "单个子代理任务的总超时（每个任务独立计时）。注意：单次工具调用还受 webui「工具调用超时」限制，不受此项控制"
+          }
+        }
+      },
+      "wrapup_timeout": {
+        "type": "integer",
+        "name": "Wrap-up Call Timeout (s)",
+        "default": 60,
+        "hint": "Timeout for the forced final-report LLM call (it carries the full task context, so slow providers need more time)",
+        "locales": {
+          "zh": {
+            "name": "收尾调用超时(秒)",
+            "hint": "强制收尾汇报那次 LLM 调用的超时（带着完整任务上下文，慢的服务商需要给大一点）"
+          }
+        }
+      },
+      "force_final_report": {
+        "type": "switch",
+        "name": "Force Final Report",
+        "default": true,
+        "hint": "On last step / timeout / error, force one final no-tool reply summarizing result or progress instead of losing everything",
+        "locales": {
+          "zh": {
+            "name": "强制收尾汇报",
+            "hint": "步数用尽/超时/出错时强制做一次无工具收尾回复，返回结果或进展，避免前功尽弃"
+          }
+        }
+      },
+      "strip_msg_tags": {
+        "type": "switch",
+        "name": "Strip Msg/Text Tags",
+        "default": true,
+        "hint": "ON (default): strip <msg>/<text> container tags from sub-agent results before delivery (sub-agent LLMs often emit framework message markup as plain text, which would otherwise show raw tags in chat). Media tags like <file> are kept",
+        "locales": {
+          "zh": {
+            "name": "清理结果消息标签",
+            "hint": "开（默认）：投递前剥掉结果里的 <msg>/<text> 容器标签（子代理常把框架消息标记当普通文本输出，不剥会在聊天里原样显示标签）。<file> 等媒体标签保留"
+          }
+        }
+      },
+      "status_query_interval": {
+        "type": "integer",
+        "name": "Status Query Min Interval (s)",
+        "default": 20,
+        "hint": "Minimum interval between consecutive subagent_status calls from the same session, preventing the main AI from polling in a loop. 0 = no limit",
+        "locales": {
+          "zh": {
+            "name": "进度查询最小间隔(秒)",
+            "hint": "同一会话连续调用 subagent_status 的最小间隔，防止主 AI 呆循环反复查询。0=不限制"
+          }
+        }
+      }
     }
   },
-  "allowed_tools": {
-    "type": "string",
-    "name": "Allowed Tools",
-    "default": "read_file, write_file, search, extract_webpage",
-    "hint": "Comma-separated list of tool names available to sub-agents",
+  "section_models": {
+    "type": "section",
+    "name": "Available Models",
+    "hint": "LLMs the main agent may assign to sub-agents",
     "locales": {
-      "zh": { "name": "可用工具列表", "hint": "子代理可用的工具名称，用英文逗号分隔" }
+      "zh": {
+        "name": "可选模型",
+        "hint": "主代理可为子代理安排的模型"
+      }
+    },
+    "fields": {
+      "available_models": {
+        "type": "list",
+        "name": "Available Models",
+        "default": [],
+        "hint": "One per line: provider;model;hint(optional). Empty = only the webui fast model is used. If filled, ONLY listed models are usable (add 'system;fast;...' to also allow the fast model)",
+        "locales": {
+          "zh": {
+            "name": "可选模型列表",
+            "hint": "每行一条：提供商;模型;擅长提示(可空)。留空=只用 webui 快速模型；填写后仅列表内可用，快速模型需加 system;fast;提示 才可用"
+          }
+        }
+      }
     }
   },
-  "allowed_read_paths": {
-    "type": "string",
-    "name": "Custom Read Paths",
-    "default": "data/files, data/temp, data/plugins",
-    "hint": "Comma-separated paths allowed for sub-agent file reading",
+  "section_tools": {
+    "type": "section",
+    "name": "Tool Control",
+    "hint": "Which tools sub-agents may use",
     "locales": {
-      "zh": { "name": "自定义读取路径", "hint": "子代理可读取的路径，用英文逗号分隔" }
+      "zh": {
+        "name": "工具管控",
+        "hint": "子代理可用工具的白/黑名单"
+      }
+    },
+    "fields": {
+      "tool_whitelist": {
+        "type": "list",
+        "name": "Tool Whitelist",
+        "default": [],
+        "hint": "If non-empty, sub-agents may ONLY use these tools. Empty = no whitelist restriction",
+        "locales": {
+          "zh": {
+            "name": "工具白名单",
+            "hint": "非空时子代理只能使用名单内工具；留空=不启用白名单"
+          }
+        }
+      },
+      "tool_blacklist": {
+        "type": "list",
+        "name": "Tool Blacklist",
+        "default": [
+          "send_email",
+          "mijia_control_device",
+          "delete_qq_msg",
+          "qzone_delete",
+          "qzone_publish"
+        ],
+        "hint": "Tools sub-agents may NOT use. exec is NOT blacklisted by default: it is governed by the official file plugin (allowed_exec_sessions / exec_deny_list) using the real session",
+        "locales": {
+          "zh": {
+            "name": "工具黑名单",
+            "hint": "子代理禁止使用的工具。默认不含 exec：exec 交由官方文件插件管控（allowed_exec_sessions / exec_deny_list，使用真实会话身份判断）"
+          }
+        }
+      },
+      "tool_match_fuzzy": {
+        "type": "switch",
+        "name": "Keyword Matching",
+        "default": true,
+        "hint": "ON: whitelist/blacklist entries match by keyword containment (e.g. 'exec' also blocks 'exec_xxx'); OFF: exact match only",
+        "locales": {
+          "zh": {
+            "name": "关键词匹配",
+            "hint": "开=按包含匹配（填 exec 会同时挡 exec_xxx）；关=全字匹配"
+          }
+        }
+      },
+      "allowed_read_paths": {
+        "type": "list",
+        "name": "Custom Read Paths",
+        "default": [
+          "data/files",
+          "data/temp",
+          "data/plugins"
+        ],
+        "hint": "Paths readable via sub_read_file, one per entry",
+        "locales": {
+          "zh": {
+            "name": "自定义读取路径",
+            "hint": "sub_read_file 可读路径，每行一个"
+          }
+        }
+      },
+      "allowed_write_paths": {
+        "type": "list",
+        "name": "Custom Write Paths",
+        "default": [
+          "data/files",
+          "data/temp"
+        ],
+        "hint": "Paths writable via sub_write_file, one per entry",
+        "locales": {
+          "zh": {
+            "name": "自定义写入路径",
+            "hint": "sub_write_file 可写路径，每行一个"
+          }
+        }
+      },
+      "inject_framework_brief": {
+        "type": "switch",
+        "name": "Inject Framework Brief",
+        "default": true,
+        "hint": "Give sub-agents a short briefing: available tools, output format requirements, and progress-report rule",
+        "locales": {
+          "zh": {
+            "name": "注入框架能力说明",
+            "hint": "给子代理注入简短说明：可用工具、输出格式要求与进展汇报规则"
+          }
+        }
+      },
+      "exec_non_blocking": {
+        "type": "switch",
+        "name": "Non-blocking Exec",
+        "default": true,
+        "hint": "ON (default): sub-agents run exec in a worker thread so the whole KiraAI process is not blocked during shell commands (file plugin exec uses a synchronous subprocess). OFF = call the original exec directly. Permission checks still apply with the real session",
+        "locales": {
+          "zh": {
+            "name": "exec 非阻塞执行",
+            "hint": "开（默认）：子代理的 exec 放到工作线程执行，执行 shell 命令期间不会卡住整个 KiraAI 进程（文件插件 exec 内部是同步 subprocess）。关=直接调用原始 exec。权限判断不受影响，仍按真实会话身份"
+          }
+        }
+      },
+      "dsml_rescue": {
+        "type": "switch",
+        "name": "DSML Rescue",
+        "default": true,
+        "hint": "ON (default): some DeepSeek proxies leak tool calls as DSML markup text instead of executing them. The plugin parses the markup and actually executes the tools, removing the markup from results. Prevents tasks from 'finishing' without the tool ever running",
+        "locales": {
+          "zh": {
+            "name": "DSML 补执行",
+            "hint": "开（默认）：部分 DeepSeek 代理会把工具调用漏成 DSML 标记文本而不执行。开启后插件会解析标记并真正执行对应工具，同时清除结果中的标记，防止任务'假完成'"
+          }
+        }
+      },
+      "sub_tool_timeout": {
+        "type": "integer",
+        "name": "Sub-agent Tool Timeout (s)",
+        "default": 120,
+        "minimum": 0,
+        "hint": "Timeout for each individual tool call made by a sub-agent, decoupled from the webui framework 'tool call timeout' (which would otherwise cap it). 0 = follow the framework webui setting",
+        "locales": {
+          "zh": {
+            "name": "子代理单次工具超时(秒)",
+            "hint": "子代理任务内每次工具调用的超时，与 webui 框架「工具调用超时」解勾（否则受它限制）。0=跟随框架 webui 设置"
+          }
+        }
+      }
     }
   },
-  "allowed_write_paths": {
-    "type": "string",
-    "name": "Custom Write Paths",
-    "default": "data/files, data/temp",
-    "hint": "Comma-separated paths allowed for sub-agent file writing",
+  "section_persona": {
+    "type": "section",
+    "name": "Persona Integration",
+    "hint": "Bind sub-agents to webui personas",
     "locales": {
-      "zh": { "name": "自定义写入路径", "hint": "子代理可写入的路径，用英文逗号分隔" }
+      "zh": {
+        "name": "人设集成",
+        "hint": "子代理与 webui 人设的绑定"
+      }
+    },
+    "fields": {
+      "default_personas": {
+        "type": "list",
+        "name": "Default SubAgent Personas",
+        "default": [
+          "子代理-代码专家;代码 审查 重构 调试",
+          "子代理-写作专家;写作 润色 文案"
+        ],
+        "hint": "One per line: persona name;tags(optional). Personas are webui-registered persona names. Order defines command numbering (/suba1 = first)",
+        "locales": {
+          "zh": {
+            "name": "默认子代理人设",
+            "hint": "每行一条：webui 人设名;标签提示(可空)。顺序即命令序号（/suba1=第1个）"
+          }
+        }
+      },
+      "keyword_persona_excerpt": {
+        "type": "switch",
+        "name": "Keyword Search Persona Excerpt",
+        "default": false,
+        "hint": "OFF (default): keyword matching in list_subagents only uses name/ID/description/tags — most token-efficient. ON: persona content also participates in matching and a short excerpt is attached to results",
+        "locales": {
+          "zh": {
+            "name": "关键词匹配附人设摘要",
+            "hint": "关（默认）：list_subagents 的关键词匹配只基于名称/ID/描述/标签，最省 token；开：人设内容也参与匹配并在结果中附带人设摘要"
+          }
+        }
+      },
+      "persona_excerpt_length": {
+        "type": "integer",
+        "name": "Persona Excerpt Length",
+        "default": 120,
+        "hint": "Max characters of the persona excerpt attached to keyword search results (only when the switch above is on)",
+        "locales": {
+          "zh": {
+            "name": "人设摘要字数",
+            "hint": "关键词结果附带的人设摘要最大字数（仅上面的开关开启时生效）"
+          }
+        }
+      },
+      "allow_llm_read_persona": {
+        "type": "switch",
+        "name": "Allow LLM Read Persona",
+        "default": false,
+        "hint": "Allow the main AI to view full persona content via get_subagent_persona (off saves tokens)",
+        "locales": {
+          "zh": {
+            "name": "允许查看人设详情",
+            "hint": "允许主 AI 用 get_subagent_persona 查看完整人设内容（关闭可省 token）"
+          }
+        }
+      },
+      "allow_llm_create_subagent": {
+        "type": "switch",
+        "name": "Allow LLM Create SubAgent",
+        "default": true,
+        "hint": "Allow the main AI to create sub-agents on the fly via register_subagent",
+        "locales": {
+          "zh": {
+            "name": "允许创建子代理",
+            "hint": "允许主 AI 用 register_subagent 临时创建子代理"
+          }
+        }
+      },
+      "allow_llm_save_persona": {
+        "type": "switch",
+        "name": "Allow LLM Save Persona",
+        "default": true,
+        "hint": "Master switch: allow the main AI to save created sub-agents as new webui personas (never overwrites existing ones)",
+        "locales": {
+          "zh": {
+            "name": "允许保存为人设（总开关）",
+            "hint": "总开关：允许主 AI 把创建的子代理保存为 webui 新人设（绝不覆盖已有人设）。关闭则下面两个相关设置均无效"
+          }
+        }
+      },
+      "llm_decide_save_persona": {
+        "type": "switch",
+        "name": "LLM Decides Whether To Save",
+        "default": true,
+        "hint": "ON: the main AI decides per sub-agent whether to save it as a persona (at creation, or later via save_subagent_persona). OFF: every LLM-created sub-agent is auto-saved. Requires the master switch above",
+        "locales": {
+          "zh": {
+            "name": "由主AI决定是否保留",
+            "hint": "开：主 AI 自行决定某个子代理是否保存为人设（创建时或任务完成后用 save_subagent_persona）；关：创建即全部自动保存。需上面的总开关开启才生效"
+          }
+        }
+      },
+      "hot_reload_saved_persona": {
+        "type": "switch",
+        "name": "Hot Reload Saved Sub-agent Personas",
+        "default": true,
+        "hint": "ON (default): saved sub-agent personas join the usable list right away. Your own unrelated personas are not included unless added to the default list above",
+        "locales": {
+          "zh": {
+            "name": "热加载新保存子代理人设",
+            "hint": "开（默认）：保存的子代理人设立即加入可用列表。不含你自己创建的无关人设，除非手动填进上方默认列表"
+          }
+        }
+      }
+    }
+  },
+  "section_resume": {
+    "type": "section",
+    "name": "Pause & Resume",
+    "hint": "Keep stopped/unfinished tasks resumable",
+    "locales": {
+      "zh": {
+        "name": "暂停与继续",
+        "hint": "停止/未完成的任务保留现场可续跑"
+      }
+    },
+    "fields": {
+      "allow_resume": {
+        "type": "switch",
+        "name": "Allow Resume",
+        "default": true,
+        "hint": "Stopped/timed-out tasks keep their state and can continue via resume_subagent or /resumesuba",
+        "locales": {
+          "zh": {
+            "name": "允许继续",
+            "hint": "停止/超时的任务保留现场，可用 resume_subagent 或 /resumesuba 接着做"
+          }
+        }
+      },
+      "resume_keep_minutes": {
+        "type": "integer",
+        "name": "Keep Finished Tasks (min)",
+        "default": 30,
+        "hint": "How long finished tasks are kept for status query / resume",
+        "locales": {
+          "zh": {
+            "name": "任务保留时长(分钟)",
+            "hint": "已结束任务保留多久（供查询/继续）"
+          }
+        }
+      }
+    }
+  },
+  "section_command": {
+    "type": "section",
+    "name": "Commands",
+    "hint": "Chat commands that bypass the LLM (like reboot/api-balance plugins)",
+    "locales": {
+      "zh": {
+        "name": "命令",
+        "hint": "不进 LLM 上下文的聊天命令"
+      }
+    },
+    "fields": {
+      "enable_commands": {
+        "type": "switch",
+        "name": "Enable Commands",
+        "default": false,
+        "hint": "Master switch for chat commands. Default OFF; turn on to use /suba etc.",
+        "locales": {
+          "zh": {
+            "name": "启用命令",
+            "hint": "聊天命令总开关，默认关闭；开启后才能使用 /suba 等命令"
+          }
+        }
+      },
+      "cmd_start_aliases": {
+        "type": "list",
+        "name": "Start Command Aliases",
+        "default": [
+          "/suba",
+          "/子代理"
+        ],
+        "hint": "Start command prefix(es); append the default-list index, e.g. /suba1 <task>",
+        "locales": {
+          "zh": {
+            "name": "启动命令别名",
+            "hint": "启动命令前缀，后接默认列表序号，如 /suba1 任务内容"
+          }
+        }
+      },
+      "cmd_stop_aliases": {
+        "type": "list",
+        "name": "Stop Command Aliases",
+        "default": [
+          "/stopsuba",
+          "/停止子代理"
+        ],
+        "hint": "Stop all running tasks, or append task ID / running index",
+        "locales": {
+          "zh": {
+            "name": "停止命令别名",
+            "hint": "停止全部运行中任务；后接任务ID或序号可停止指定任务"
+          }
+        }
+      },
+      "cmd_resume_aliases": {
+        "type": "list",
+        "name": "Resume Command Aliases",
+        "default": [
+          "/resumesuba",
+          "/继续子代理"
+        ],
+        "hint": "Resume a stopped task: /resumesuba <task_id> [extra instruction]",
+        "locales": {
+          "zh": {
+            "name": "继续命令别名",
+            "hint": "继续已停止任务：/resumesuba 任务ID [追加指示]"
+          }
+        }
+      },
+      "cmd_result_to_main_llm": {
+        "type": "switch",
+        "name": "Command Results To Main LLM",
+        "default": false,
+        "hint": "OFF: results of command-spawned tasks are sent to the user directly; ON: reported to the main AI first",
+        "locales": {
+          "zh": {
+            "name": "命令结果回主AI",
+            "hint": "关=命令启动的任务结果直接发用户；开=先汇报主 AI"
+          }
+        }
+      },
+      "stop_return_progress": {
+        "type": "switch",
+        "name": "Return Progress On Stop",
+        "default": true,
+        "hint": "When a stop command is received, reply with current progress; OFF = stop silently",
+        "locales": {
+          "zh": {
+            "name": "停止时返回进度",
+            "hint": "收到停止命令时返回当前进度；关闭则直接停止不返回"
+          }
+        }
+      },
+      "cmd_allowed_users": {
+        "type": "list",
+        "name": "Command Allowed Users",
+        "default": [],
+        "hint": "QQ number whitelist for using commands. Empty = everyone can use; filled = only listed QQ numbers can use. One per line. Only restricts commands, not main-AI tool calls",
+        "locales": {
+          "zh": {
+            "name": "命令白名单用户",
+            "hint": "只有名单中的 QQ 号可以使用子代理命令，每行一个。留空=所有人可用。仅约束命令，不影响主 AI 的工具调用"
+          }
+        }
+      },
+      "cmd_include_hot_loaded": {
+        "type": "switch",
+        "name": "Commands Include Hot-loaded",
+        "default": true,
+        "hint": "ON (default): when hot-reload is enabled, AI-created saved sub-agents are also callable by command index, listed after the default list. OFF = commands can only start sub-agents from the default personas list",
+        "locales": {
+          "zh": {
+            "name": "命令包含热加载子代理",
+            "hint": "开（默认）：热加载开启时，AI 创建并保存的子代理也加入命令序号列表（排在默认列表之后），可用 /suba序号 调用。关=命令只能启动默认人设列表里的子代理"
+          }
+        }
+      }
+    }
+  },
+  "section_messages": {
+    "type": "section",
+    "name": "Command Reply Templates",
+    "collapsed": true,
+    "locales": {
+      "zh": {
+        "name": "命令回复语模版"
+      }
+    },
+    "fields": {
+      "cmd_denied_message": {
+        "type": "textarea",
+        "name": "Command Denied Message",
+        "default": "⛔ 你没有使用子代理命令的权限。",
+        "hint": "Message replied when a user not in the whitelist triggers a command",
+        "locales": {
+          "zh": {
+            "name": "权限拒绝提示语",
+            "hint": "非白名单用户触发命令时回复的消息"
+          }
+        }
+      },
+      "msg_no_default": {
+        "type": "textarea",
+        "name": "No Default SubAgent Message",
+        "default": "尚未设置默认的子代理，请在插件设置的 default_personas 中配置。",
+        "hint": "Replied when a start command is used but no default sub-agents are configured",
+        "locales": {
+          "zh": {
+            "name": "无默认子代理提示",
+            "hint": "使用启动命令但未配置默认子代理时的回复"
+          }
+        }
+      },
+      "msg_invalid_index": {
+        "type": "textarea",
+        "name": "Invalid Index Message",
+        "default": "无效的子代理序号 {index}。当前默认子代理：\n{list}",
+        "hint": "Placeholders: {index} {list}",
+        "locales": {
+          "zh": {
+            "name": "无效序号提示",
+            "hint": "占位符：{index} {list}"
+          }
+        }
+      },
+      "msg_started": {
+        "type": "textarea",
+        "name": "Started Message",
+        "default": "已派出子代理「{name}」处理任务（任务ID {task_id}），完成后我会告诉你。",
+        "hint": "Placeholders: {name} {task_id} {task} {index}",
+        "locales": {
+          "zh": {
+            "name": "启动成功提示",
+            "hint": "占位符：{name} {task_id} {task} {index}"
+          }
+        }
+      },
+      "msg_stopped": {
+        "type": "textarea",
+        "name": "Stopped Message",
+        "default": "已停止子代理任务 {task_id}（{name}）。",
+        "hint": "Placeholders: {task_id} {name}",
+        "locales": {
+          "zh": {
+            "name": "停止成功提示",
+            "hint": "占位符：{task_id} {name}"
+          }
+        }
+      },
+      "msg_none_running": {
+        "type": "textarea",
+        "name": "None Running Message",
+        "default": "当前没有正在运行的子代理任务。",
+        "hint": "Replied when stop is used but nothing is running",
+        "locales": {
+          "zh": {
+            "name": "无运行任务提示",
+            "hint": "停止命令没有可停止任务时的回复"
+          }
+        }
+      },
+      "cmd_result_template": {
+        "type": "textarea",
+        "name": "Command Result Template",
+        "default": "【子代理 {name}】任务完成：\n{result}",
+        "hint": "Direct-send result template. Placeholders: {name} {task_id} {task} {result} {status}",
+        "locales": {
+          "zh": {
+            "name": "命令结果模板",
+            "hint": "直发用户的结果模板。占位符：{name} {task_id} {task} {result} {status}"
+          }
+        }
+      },
+      "notify_template": {
+        "type": "textarea",
+        "name": "Main-LLM Notify Template",
+        "default": "【系统通知】你派出的子代理「{name}」（任务ID {task_id}）已完成任务「{task}」，结果如下。请以自己的口吻向用户汇报：\n{result}",
+        "hint": "Notice injected to the main AI on completion. Placeholders: {name} {task_id} {task} {result} {status}",
+        "locales": {
+          "zh": {
+            "name": "主AI通知模板",
+            "hint": "完成时注入主 AI 的通知。占位符：{name} {task_id} {task} {result} {status}"
+          }
+        }
+      }
+    }
+  },
+  "section_debug": {
+    "type": "section",
+    "name": "Debug",
+    "collapsed": true,
+    "locales": {
+      "zh": {
+        "name": "调试"
+      }
+    },
+    "fields": {
+      "debug_enabled": {
+        "type": "switch",
+        "name": "Debug Mode",
+        "default": false,
+        "hint": "Master debug switch: logs key events (spawn/stop/resume/deliver, config snapshot, scope checks) to help troubleshooting. OFF = only essential logs",
+        "locales": {
+          "zh": {
+            "name": "调试模式",
+            "hint": "调试总开关：在日志中输出关键事件（派发/停止/继续/结果投递、配置快照、会话作用域判断等），方便排查问题。关闭则只保留必要日志"
+          }
+        }
+      },
+      "quiet_subagent_logs": {
+        "type": "switch",
+        "name": "Quiet Sub-agent Logs",
+        "default": true,
+        "hint": "ON (default): suppress framework process logs emitted by sub-agents (tool args/results, shell commands, LLM step lines) so they don't spam the console. Key events (dispatch/complete/timeout/error) are still logged by this plugin. Auto-disabled while debug mode is ON",
+        "locales": {
+          "zh": {
+            "name": "静默子代理过程日志",
+            "hint": "开（默认）：子代理运行期间框架打的工具参数/结果、shell 命令、模型步骤等日志不再输出，防止刷屏；派发/完成/超时/错误等关键事件仍由本插件记录。调试模式开启时此项自动失效"
+          }
+        }
+      },
+      "debug_log_prompts": {
+        "type": "switch",
+        "name": "Log Full Prompts",
+        "default": false,
+        "hint": "Log each sub-agent's FULL persona/system brief/task text. Requires debug mode ON. Note: may contain sensitive content",
+        "locales": {
+          "zh": {
+            "name": "记录完整提示词",
+            "hint": "在日志中完整显示每个子代理的人设、系统简报和任务内容。需先开启调试模式。注意：内容可能较长或含敏感信息"
+          }
+        }
+      },
+      "debug_log_steps": {
+        "type": "switch",
+        "name": "Log Step Details",
+        "default": false,
+        "hint": "Log every step of each sub-agent: full model output text and tool call details. Requires debug mode ON",
+        "locales": {
+          "zh": {
+            "name": "记录每步详情",
+            "hint": "在日志中显示子代理每一步的完整模型输出和工具调用详情。需先开启调试模式"
+          }
+        }
+      },
+      "debug_log_results": {
+        "type": "switch",
+        "name": "Log Full Results",
+        "default": false,
+        "hint": "Log full final result/wrap-up report and delivery path of each task. Requires debug mode ON",
+        "locales": {
+          "zh": {
+            "name": "记录完整结果",
+            "hint": "在日志中完整显示每个任务的最终结果/收尾报告及投递方式。需先开启调试模式"
+          }
+        }
+      }
     }
   }
 }
