@@ -131,11 +131,11 @@
         "type": "integer",
         "name": "Default Timeout (s)",
         "default": 300,
-        "hint": "Default total timeout per sub-agent task (each task times independently). Note: each individual tool call is separately capped by the webui 'tool call timeout' setting, not by this",
+        "hint": "Default total timeout per sub-agent task (each task times independently, 0 = unlimited). Per-tool-call timeout inside a task is configured separately in 'Tool call timeout' (decoupled from the framework setting)",
         "locales": {
           "zh": {
             "name": "默认超时(秒)",
-            "hint": "单个子代理任务的总超时（每个任务独立计时）。注意：单次工具调用还受 webui「工具调用超时」限制，不受此项控制"
+            "hint": "单个子代理任务的总超时（每个任务独立计时），0=无限制。任务内单次工具调用的超时由「子代理单次工具超时」单独配置（已与框架设置解勾）"
           }
         }
       },
@@ -204,11 +204,11 @@
         "type": "list",
         "name": "Available Models",
         "default": [],
-        "hint": "One per line: provider;model;hint(optional). Empty = only the webui fast model is used. If filled, ONLY listed models are usable (add 'system;fast;...' to also allow the fast model)",
+        "hint": "One per line: provider;model;hint(optional). Empty = only the webui fast model is used. If filled, ONLY listed models are usable; to also allow the fast model, add its actual provider;model from the webui model settings",
         "locales": {
           "zh": {
             "name": "可选模型列表",
-            "hint": "每行一条：提供商;模型;擅长提示(可空)。留空=只用 webui 快速模型；填写后仅列表内可用，快速模型需加 system;fast;提示 才可用"
+            "hint": "每行一条：提供商;模型;擅长提示(可空)。留空=只用 webui 快速模型；填写后仅列表内可用，快速模型需按 webui 模型配置里的真实 提供商;模型 手动加一行才可用"
           }
         }
       }

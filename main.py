@@ -2,7 +2,7 @@
 SubAgent plugin for KiraAI
 让主代理能够将任务委派给拥有独立人设、工具集和模型配置的子代理。
 
-v0.2.0 重写要点：
+v1.0.0 设计要点：
 - 异步派发模式：spawn_subagent 立即返回，子代理后台执行，完成后经消息缓冲
   防抖机制"尽力合并"地通知主 LLM 主动向用户汇报（或直接发用户，可配置）
 - 任务管理：subagent_status / stop_subagent / resume_subagent + 命令双通道
@@ -109,6 +109,8 @@ _FILE_TAG_RE = re.compile(
     r"<file(?:\s+type=\"(image|record|video|file)\")?\s*>(.*?)</file>", re.S | re.I)
 
 
+_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024  # data URI 附件上限
+
 _MIME_EXT = {
     "image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
     "image/gif": ".gif", "image/webp": ".webp", "image/svg+xml": ".svg",
@@ -145,18 +147,23 @@ def _resolve_data_uri_files(text: str, task_id: str = "") -> str:
             return m.group(0)
         mime = dm.group(1).lower()
         b64 = re.sub(r"\s+", "", dm.group(2))
+        # 解码前先按 base64 长度估算原始大小（编码后约为原始的 4/3），
+        # 避免巨大附件完整解码造成内存峰值
+        if len(b64) * 3 // 4 > _MAX_ATTACHMENT_BYTES:
+            return "[附件超过 25MB，已丢弃]"
+        import binascii
         try:
             raw = base64.b64decode(b64, validate=True)
-        except Exception:
+        except (binascii.Error, ValueError):
             return "[附件 base64 数据损坏，无法还原]"
-        if len(raw) > 25 * 1024 * 1024:
+        if len(raw) > _MAX_ATTACHMENT_BYTES:
             return "[附件超过 25MB，已丢弃]"
         ext = _MIME_EXT.get(mime, ".bin")
         out = get_data_path() / "temp" / f"subagent_{task_id or 'file'}_{int(time.time() * 1000)}{ext}"
         try:
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_bytes(raw)
-        except Exception:
+        except OSError:
             return m.group(0)
         return f'<file type="{ftype}">data/temp/{out.name}</file>'
 
@@ -251,7 +258,7 @@ class _SubagentLLMShim:
         for tool_call in resp.tool_calls:
             tool_call_id = tool_call.get("id")
             name = tool_call.get("function", {}).get("name")
-            raw_args = tool_call.get("function", {}).get("arguments")
+            raw_args = tool_call.get("function", {}).get("arguments") or ""
             try:
                 args = {} if not raw_args.strip() else json.loads(raw_args)
             except json.JSONDecodeError as e:
@@ -532,6 +539,9 @@ class SubAgentPlugin(BasePlugin):
         """旧时代存档迁移：早期版本默认总超时是 120，注册/编辑时被显式写进
         subagents.json（timeout: 120），导致用户后来改了默认超时这些存档也不跟进。
         与步数地板迁移同理：把恰好等于旧默认 120 的存档超时改为 0（跟随插件默认值）。"""
+        # 只迁移一次：否则用户在迁移后故意把超时设回 120，每次重启都会被重置
+        if self._store.get("_migration_version", 0) >= 1:
+            return
         migrated = []
         for said, rec in self._store.get("saved", {}).items():
             try:
@@ -540,8 +550,9 @@ class SubAgentPlugin(BasePlugin):
                     migrated.append(said)
             except (TypeError, ValueError):
                 continue
+        self._store["_migration_version"] = 1
+        self._store_save()
         if migrated:
-            self._store_save()
             sub_logger.info(
                 f"[subagent] 旧默认超时迁移：{', '.join(migrated)} 的存档超时 120s → 跟随插件默认值")
 
@@ -766,7 +777,7 @@ class SubAgentPlugin(BasePlugin):
         return "; ".join(lines)
 
     def _fast_model_label(self) -> str:
-        """当前 webui 快速模型的真实标识（provider:model），用于提示用户手动添加。"""
+        """当前 webui 快速模型的真实标识（provider;model，与 available_models 行格式一致）。"""
         try:
             client = self.ctx.get_default_fast_llm_client()
             m = getattr(client, "model", None)
@@ -774,7 +785,7 @@ class SubAgentPlugin(BasePlugin):
                 provider = getattr(m, "provider_name", "") or getattr(m, "provider_id", "")
                 model_id = getattr(m, "model_id", "")
                 if provider and model_id:
-                    return f"{provider}:{model_id}"
+                    return f"{provider};{model_id}"
         except Exception:
             pass
         return "（无法识别，请到 webui 模型配置里查看）"
@@ -993,6 +1004,18 @@ class SubAgentPlugin(BasePlugin):
     def _effective_steps(self, cfg: SubAgentConfig) -> int:
         return min(cfg.max_steps or self.default_max_steps, self.max_steps_limit)
 
+    _TPL_KEYS = ("name", "task_id", "task", "result", "status", "index", "total", "count", "list")
+
+    def _fmt_tpl(self, tpl, **kw) -> str:
+        """用户自定义模板容错格式化：未知占位符给空串，格式化失败退回模板原文。"""
+        base = {k: "" for k in self._TPL_KEYS}
+        base.update({k: ("" if v is None else v) for k, v in kw.items()})
+        try:
+            # defaultdict：未知占位符替换为空串而不是抛 KeyError 丢掉整条结果
+            return str(tpl).format_map(__import__("collections").defaultdict(str, base))
+        except Exception:
+            return str(tpl)
+
     def _effective_timeout(self, cfg: SubAgentConfig) -> float:
         return cfg.timeout if cfg.timeout > 0 else self.default_timeout
 
@@ -1122,8 +1145,15 @@ class SubAgentPlugin(BasePlugin):
                         f"若任务未完成，说明已完成部分、当前进展和卡点。"
                         f"如有生成的文件/图片，在末尾用 <file type=\"image\">路径</file> 附上。）",
             ))
-            resp = await asyncio.wait_for(task.llm_model.chat(request), timeout=self.wrapup_timeout)
-            return (resp.text_response or "").strip()
+            try:
+                resp = await asyncio.wait_for(task.llm_model.chat(request), timeout=self.wrapup_timeout)
+                return (resp.text_response or "").strip()
+            finally:
+                # 收尾注入的消息不能留在对话历史里，否则 resume 后 LLM 仍被告知"不能调用工具"
+                try:
+                    request.messages.pop()
+                except Exception:
+                    pass
         except Exception as e:
             # e 的 str 可能为空（如部分 TimeoutError/APIError），用 repr 输出完整信息。
             # 完整堆栈仅调试模式输出（平时打出来全是 TLS 底层堆栈，太刷屏）
@@ -1250,11 +1280,12 @@ class SubAgentPlugin(BasePlugin):
                             "直接发用户" if (task.origin == "command" and not self.cmd_result_to_main_llm)
                             else "注入缓冲通知主AI",
                             task.result or "（空）")
-        if task.origin == "command" and not self.cmd_result_to_main_llm:
+        if (self.result_delivery == "direct_send"
+                or (task.origin == "command" and not self.cmd_result_to_main_llm)):
             try:
                 result_text, media = _extract_file_elements(task.result)
                 chain = [Text(
-                    self.cmd_result_template.format(
+                    self._fmt_tpl(self.cmd_result_template,
                         name=task.name, task_id=task.task_id, task=task.task_text,
                         result=result_text, status=status_word,
                     )
@@ -1269,7 +1300,7 @@ class SubAgentPlugin(BasePlugin):
             await asyncio.sleep(self.merge_window_ms / 1000)
         try:
             await self.ctx.publish_notice(task.sid, MessageChain([Text(
-                self.notify_template.format(
+                self._fmt_tpl(self.notify_template,
                     name=task.name, task_id=task.task_id, task=task.task_text,
                     result=task.result, status=status_word,
                 )
@@ -1313,13 +1344,8 @@ class SubAgentPlugin(BasePlugin):
         self._dbg("停止任务 %s(%s)，停止前状态=%s，进度=%s/%s 步",
                   task.task_id, task.name, task.state, task.current_step, task.max_steps)
         task.handle.cancel()
-        if task.state == "queued":
-            # 任务还没来得及开始跑就被取消：CancelledError 不会进入 runner，
-            # 需要在这里完成状态收尾（running 状态的由 runner 的 CancelledError 分支处理）
-            task.state = "stopped"
-            task.finished_at = time.time()
-            asyncio.create_task(self._after_stopped(task))
-            self._schedule_task_cleanup(task)
+        # 状态收尾统一由 runner 的 CancelledError 分支完成（即使任务还排在信号量队列里，
+        # 协程也已启动并阻塞在 acquire 上，取消后一定会进入 runner 的 except 分支）
         return True
 
     # ------------------------------------------------------------------
@@ -1445,7 +1471,7 @@ class SubAgentPlugin(BasePlugin):
             subagent_id=subagent_id, name=name, description=description, persona=persona,
             persona_id=persona_id, source="llm", tools=tools or [],
             max_steps=self._apply_llm_steps(max_steps),
-            timeout=float(timeout), model=model,
+            timeout=min(max(float(timeout), 0.0), 3600.0), model=model,  # LLM 传参硬钳制
         )
         self._configs[subagent_id] = cfg
         self._persist_saved(cfg)  # 持久化，重启不丢
@@ -1551,7 +1577,7 @@ class SubAgentPlugin(BasePlugin):
         if max_steps is not None:
             config.max_steps = self._apply_llm_steps(max_steps)
         if timeout is not None:
-            config.timeout = float(timeout)
+            config.timeout = min(max(float(timeout), 0.0), 3600.0)  # LLM 传参硬钳制
         if model is not None:
             config.model = model
         # 所有来源都持久化：内置/用户人设子代理以 override 形式存（人设文本仍以 webui 为准），
@@ -1732,6 +1758,8 @@ class SubAgentPlugin(BasePlugin):
                 return "当前没有任何子代理任务记录。"
             lines = []
             for t in self._tasks.values():
+                if t.sid != event.sid:
+                    continue  # 会话隔离：不暴露其他会话的任务
                 elapsed = int((t.finished_at or time.time()) - t.created_at)
                 lines.append(
                     f"[{t.task_id}] {t.name}({t.subagent_id}) {t.state} "
@@ -1739,7 +1767,7 @@ class SubAgentPlugin(BasePlugin):
                 )
             return "子代理任务:\n" + "\n".join(lines)
         t = self._tasks.get(task_id)
-        if not t:
+        if not t or t.sid != event.sid:
             return f"错误: 任务 '{task_id}' 不存在或已被清理。"
         detail = (
             f"任务 {t.task_id}: 子代理 {t.name}({t.subagent_id})\n"
@@ -1768,7 +1796,7 @@ class SubAgentPlugin(BasePlugin):
         if not self._in_scope(event.sid):
             return "当前会话未启用子代理功能。"
         t = self._tasks.get(task_id)
-        if not t:
+        if not t or t.sid != event.sid:
             return f"错误: 任务 '{task_id}' 不存在。"
         if not self._stop_task(t):
             return f"任务 '{task_id}' 当前状态为 {t.state}，无法停止。"
@@ -1795,7 +1823,7 @@ class SubAgentPlugin(BasePlugin):
         if not self.allow_resume:
             return "当前配置不允许恢复子代理任务。"
         t = self._tasks.get(task_id)
-        if not t:
+        if not t or t.sid != event.sid:
             return f"错误: 任务 '{task_id}' 不存在或已被清理。"
         if t.state in ("queued", "running"):
             return f"任务 '{task_id}' 正在运行中，无需恢复。"
@@ -1898,12 +1926,12 @@ class SubAgentPlugin(BasePlugin):
             await self._cmd_reply(event, self.msg_no_default)
             return
         if index < 1 or index > len(order):
-            await self._cmd_reply(event, self.msg_invalid_index.format(
+            await self._cmd_reply(event, self._fmt_tpl(self.msg_invalid_index,
                 index=index, list=self._default_list_text()))
             return
         cfg = self._configs.get(order[index - 1])
         if not cfg:
-            await self._cmd_reply(event, self.msg_invalid_index.format(
+            await self._cmd_reply(event, self._fmt_tpl(self.msg_invalid_index,
                 index=index, list=self._default_list_text()))
             return
         if not task_text:
@@ -1915,7 +1943,7 @@ class SubAgentPlugin(BasePlugin):
             return
         t = self._spawn(cfg, event.session.sid, "command", task_text, llm_model)
         sub_logger.info(f"Command spawned task {t.task_id} ({cfg.subagent_id}) in {event.session.sid}")
-        await self._cmd_reply(event, self.msg_started.format(
+        await self._cmd_reply(event, self._fmt_tpl(self.msg_started,
             name=cfg.name, task_id=t.task_id, task=task_text, index=index))
 
     async def _cmd_stop(self, event: KiraMessageEvent, arg: str):
@@ -1948,7 +1976,7 @@ class SubAgentPlugin(BasePlugin):
         names = "、".join(f"{t.task_id}({t.name})" for t in stopped)
         # 进度详情由 _after_stopped 按 stop_return_progress 配置逐任务发送
         if not self.stop_return_progress:
-            await self._cmd_reply(event, self.msg_stopped.format(task_id=names, name=""))
+            await self._cmd_reply(event, self._fmt_tpl(self.msg_stopped, task_id=names, name=""))
         else:
             event.discard(force=True)
             event.stop()
