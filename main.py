@@ -97,10 +97,12 @@ def _clean_result_markup(text: str) -> str:
     """剥掉结果文本里的 <msg>/<text> 容器标签（可多层嵌套），其余标签保留。"""
     if not text or ("<" not in text):
         return text
-    prev = None
-    while prev != text:   # 多层嵌套时反复剥
-        prev = text
-        text = _MSG_TAG_RE.sub("", text)
+    # 限制最大替换次数防止意外死循环，正常最多 10 层嵌套足够
+    for _ in range(10):
+        cleaned = _MSG_TAG_RE.sub("", text)
+        if cleaned == text:
+            break
+        text = cleaned
     return text.strip()
 
 
@@ -178,11 +180,12 @@ def _extract_file_elements(text: str):
     elements = []
 
     def _resolve(raw: str) -> str:
-        v = raw.strip().replace("\\", "/")
+        v = raw.strip()
         if not v:
             return ""
         if v.startswith(("http://", "https://")):
             return v
+        # 使用 Path 标准化路径，自动处理 Windows/Unix 分隔符
         p = Path(v)
         if p.is_absolute():
             return str(p) if p.exists() else ""
