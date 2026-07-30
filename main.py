@@ -2,7 +2,7 @@
 SubAgent plugin for KiraAI
 让主代理能够将任务委派给拥有独立人设、工具集和模型配置的子代理。
 
-v1.0.0 设计要点：
+v1.0.1 设计要点：
 - 异步派发模式：spawn_subagent 立即返回，子代理后台执行，完成后经消息缓冲
   防抖机制"尽力合并"地通知主 LLM 主动向用户汇报（或直接发用户，可配置）
 - 任务管理：subagent_status / stop_subagent / resume_subagent + 命令双通道
@@ -31,7 +31,7 @@ from core.utils.path_utils import get_data_path
 from core.prompt_manager import Prompt
 from core.provider import LLMRequest
 from core.chat.session import Session
-from core.chat.message_utils import KiraMessageBatchEvent, KiraMessageEvent
+from core.chat.message_utils import KiraMessageBatchEvent, KiraMessageEvent, KiraIMMessage
 from core.chat import MessageChain
 from core.chat.message_elements import Text
 from core.adapter.adapter_info import AdapterInfo
@@ -97,12 +97,10 @@ def _clean_result_markup(text: str) -> str:
     """剥掉结果文本里的 <msg>/<text> 容器标签（可多层嵌套），其余标签保留。"""
     if not text or ("<" not in text):
         return text
-    # 限制最大替换次数防止意外死循环，正常最多 10 层嵌套足够
-    for _ in range(10):
-        cleaned = _MSG_TAG_RE.sub("", text)
-        if cleaned == text:
-            break
-        text = cleaned
+    prev = None
+    while prev != text:   # 多层嵌套时反复剥
+        prev = text
+        text = _MSG_TAG_RE.sub("", text)
     return text.strip()
 
 
@@ -180,12 +178,11 @@ def _extract_file_elements(text: str):
     elements = []
 
     def _resolve(raw: str) -> str:
-        v = raw.strip()
+        v = raw.strip().replace("\\", "/")
         if not v:
             return ""
         if v.startswith(("http://", "https://")):
             return v
-        # 使用 Path 标准化路径，自动处理 Windows/Unix 分隔符
         p = Path(v)
         if p.is_absolute():
             return str(p) if p.exists() else ""
@@ -966,11 +963,20 @@ class SubAgentPlugin(BasePlugin):
             adapter_name, st, sess_id = sid.split(":", 2)
         except ValueError:
             adapter_name, st, sess_id = "subagent", "dm", sid
+        session = Session(adapter_name=adapter_name, session_type=st, session_id=sess_id)
+        # 放一条合成消息：框架的 ON_LLM_RESPONSE 钩子会把本事件广播给所有插件，
+        # 不少插件直接访问 event.messages[-1]（如 is_group_message()），空列表会 IndexError
+        dummy_msg = KiraIMMessage(
+            message_id="subagent_stub", self_id="subagent",
+            chain=MessageChain([]), timestamp=int(time.time()),
+            session=session, group=None,
+        )
         return KiraMessageBatchEvent(
             message_types=[],
             timestamp=int(time.time()),
-            session=Session(adapter_name=adapter_name, session_type=st, session_id=sess_id),
+            session=session,
             adapter=_STUB_ADAPTER,
+            messages=[dummy_msg],
         )
 
     def _subagent_brief(self, tool_set: ToolSet) -> str:
