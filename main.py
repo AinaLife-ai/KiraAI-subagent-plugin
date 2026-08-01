@@ -1685,7 +1685,10 @@ class SubAgentPlugin(BasePlugin):
             default_mark = ("（协调者）" if cfg.tier == "coordinator"
                             else "（默认）" if cid in self._default_order
                             else "（热加载）" if cid in self._hot_loaded_order else "")
-            model_str = cfg.model or ("列表首选" if self.available_models else "fast")
+            tier_models = (self.coordinator_models
+                           if (cfg.tier == "coordinator" and self.coordinator_models)
+                           else self.available_models)
+            model_str = cfg.model or ("列表首选" if tier_models else "fast")
             lines.append(
                 f"[{cid}] {cfg.name}{default_mark} 来源:{_source_label(cfg.source)} — {cfg.description}\n"
                 f"    步数:{self._effective_steps(cfg)}(上限{self.coordinator_max_steps_limit if cfg.tier == 'coordinator' else self.max_steps_limit}) "

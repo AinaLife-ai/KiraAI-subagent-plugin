@@ -575,11 +575,11 @@
         "type": "integer",
         "name": "Task Timeout (s)",
         "default": 900,
-        "hint": "Total timeout per coordinator task. Default 15 min, since it serially waits for many lower-level sub-agents.",
+        "hint": "Total timeout per coordinator task. Default 15 min: it goes through multiple dispatch/collect/review rounds, and each round waits for all lower-level sub-agents in that round to finish.",
         "locales": {
           "zh": {
             "name": "任务超时(秒)",
-            "hint": "协调者任务总超时。默认 15 分钟，因为它要串行等待多个下级子代理跑完。"
+            "hint": "协调者任务总超时。默认 15 分钟：它要走多轮分派/收集/审查，每轮都要等该轮全部下级跑完（同一轮内下级是并行的）。"
           }
         }
       },
