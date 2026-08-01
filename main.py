@@ -1234,8 +1234,12 @@ class SubAgentPlugin(BasePlugin):
                     sub_logger.info(
                         f"[subagent] 检测到 DSML 泄漏，补执行工具 {name}（任务 {task.task_id}）: "
                         f"{json.dumps(args, ensure_ascii=False)[:200]}")
-                    res = await asyncio.wait_for(tool.execute(stub_event, **args),
-                                                 timeout=self.sub_tool_timeout if self.sub_tool_timeout > 0 else 60)
+                    if name == "collect_subagent_results":
+                        # 与 shim 一致：collect 要等下级跑完，不受单次工具超时约束
+                        res = await tool.execute(stub_event, **args)
+                    else:
+                        res = await asyncio.wait_for(tool.execute(stub_event, **args),
+                                                     timeout=self.sub_tool_timeout if self.sub_tool_timeout > 0 else 60)
                     appendix.append(f"[工具 {name} 补执行结果]\n{res}")
                 except Exception as e:
                     appendix.append(f"[工具 {name} 补执行失败: {e!r}]")
@@ -1854,6 +1858,12 @@ class SubAgentPlugin(BasePlugin):
             # 不允许 LLM（含协调者自己）改，且修改会持久化，影响面大
             return (f"错误: '{subagent_id}' 是协调者，不可通过工具修改"
                     f"（请在插件设置 coordinator_personas 或 webui 人设界面调整）。")
+        caller = _CURRENT_TASK.get(None)
+        if caller is not None and caller.tier == "coordinator" and config.source != "coordinator":
+            # 协调者只能改自己创建的下级（source=coordinator，含内存级与已保存的）；
+            # 内置/用户人设/主AI创建的不归它管（改那些会写 override 持久化，越权）
+            return (f"错误: 你只能修改自己创建的下级子代理，"
+                    f"'{subagent_id}' 是{_source_label(config.source)}子代理，不归你管。")
         if config.source == "builtin" and persona is not None:
             return f"错误: '{subagent_id}' 是内置子代理，请在 webui 人设界面修改其人设内容。"
         if model:
@@ -1875,8 +1885,11 @@ class SubAgentPlugin(BasePlugin):
         if model is not None:
             config.model = model
         # 所有来源都持久化：内置/用户人设子代理以 override 形式存（人设文本仍以 webui 为准），
-        # 步数/超时/模型等修改重启不丢
-        self._persist_saved(config)
+        # 步数/超时/模型等修改重启不丢；内存级下级（协调者创建未保存的）除外
+        if subagent_id in self._coordinator_spawned:
+            self._dbg("内存级下级 %s 的修改仅本次有效，不持久化", subagent_id)
+        else:
+            self._persist_saved(config)
         sub_logger.info(f"Edited sub-agent: {subagent_id}")
         return (f"子代理 '{subagent_id}' 已更新。当前: 名称={config.name}, 步数={config.max_steps or self.default_max_steps}, "
                 f"超时={self._effective_timeout(config):.0f}s, 模型={config.model or '默认'}, 工具={config.tools or '按黑白名单'}")
@@ -2072,6 +2085,9 @@ class SubAgentPlugin(BasePlugin):
         self._tasks[t.task_id] = t
         t.state = "running"
         t.started_at = time.time()
+        # 与异步路径一致：同步执行也要标记当前任务，否则协调者会被当成主 LLM
+        # （派下级被拒/注册走错持久化路径），且结束时不会级联清理下级
+        _task_token = _CURRENT_TASK.set(t)
         try:
             result = await asyncio.wait_for(
                 self._execute_subagent(t, cfg), timeout=self._effective_timeout(cfg)
@@ -2088,6 +2104,10 @@ class SubAgentPlugin(BasePlugin):
             return f"Error: SubAgent '{subagent_id}' failed: {e}"
         finally:
             t.finished_at = time.time()
+            if cfg.tier == "coordinator":
+                self._cancel_children(t)            # 同步路径同样级联取消漏网下级
+                self._purge_coordinator_spawned(t)  # 同步回收内存级下级
+            _CURRENT_TASK.reset(_task_token)
             self._schedule_task_cleanup(t)
         return f"SubAgent '{cfg.name}' result:\n{t.result}"
 
