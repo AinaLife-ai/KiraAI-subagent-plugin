@@ -498,6 +498,117 @@
       }
     }
   },
+  "section_coordinator": {
+    "type": "section",
+    "name": "Coordinator",
+    "hint": "A coordinator is a 'sub-agent that manages other sub-agents'. When enabled, the main LLM hands tasks only to coordinators, which break tasks down, dispatch lower-level sub-agents, track and review until done. Best for complex multi-step, multi-role tasks; no need for simple daily tasks.",
+    "locales": {
+      "zh": {
+        "name": "协调者",
+        "hint": "协调者是\u201c管其他子代理的子代理\u201d。开启后主 AI 只把任务交给协调者，由它拆解任务、分派下级子代理、跟踪与审查，直到完成。适合多步骤、多角色协作的复杂任务；日常简单任务无需开启。"
+      }
+    },
+    "fields": {
+      "enable_coordinator": {
+        "type": "switch",
+        "name": "Enable Coordinator",
+        "default": false,
+        "hint": "Master switch. When ON: the main LLM can only dispatch coordinators (chat command indices also map to coordinators); coordinators dispatch and manage lower-level sub-agents themselves.",
+        "locales": {
+          "zh": {
+            "name": "启用协调者",
+            "hint": "总开关，默认关闭。开启后：主 AI 只能把任务派给协调者（命令序号也对应协调者），由协调者自行分派、管理下级子代理。"
+          }
+        }
+      },
+      "coordinator_personas": {
+        "type": "list",
+        "name": "Coordinator Personas",
+        "default": [
+          "子代理-规划师;规划 拆解 管理"
+        ],
+        "hint": "One per line: persona_name;tags(optional). Independent from the default sub-agent list; personas are registered/read in isolation and never appear in the normal sub-agent list. The main LLM cannot create coordinators.",
+        "locales": {
+          "zh": {
+            "name": "协调者人设",
+            "hint": "每行一条：人设名;擅长标签(可空)。独立于默认子代理列表，注册与读取两侧完全隔离，不会出现在普通子代理列表中；主 AI 不能自创建协调者。"
+          }
+        }
+      },
+      "coordinator_models": {
+        "type": "list",
+        "name": "Coordinator Models",
+        "default": [],
+        "hint": "Models assignable to coordinators, same format as available_models (provider;model;hint). Empty = fall back to available_models.",
+        "locales": {
+          "zh": {
+            "name": "协调者可用模型",
+            "hint": "协调者可用的模型列表，格式同可选模型（提供商;模型;擅长提示）。留空=回退使用可选模型列表。"
+          }
+        }
+      },
+      "coordinator_default_steps": {
+        "type": "integer",
+        "name": "Default Steps",
+        "default": 25,
+        "hint": "Default max reasoning steps per coordinator task (it needs more steps than lower-level sub-agents to dispatch/collect/review).",
+        "locales": {
+          "zh": {
+            "name": "默认步数",
+            "hint": "协调者单次任务默认步数。它要分派、收集、审查多个下级，需要的步数比下级子代理多。"
+          }
+        }
+      },
+      "coordinator_max_steps_limit": {
+        "type": "integer",
+        "name": "Steps Hard Limit",
+        "default": 50,
+        "hint": "Hard step cap for coordinators, INDEPENDENT from the global hard limit (the global one only constrains lower-level sub-agents).",
+        "locales": {
+          "zh": {
+            "name": "步数硬上限",
+            "hint": "协调者步数硬上限，独立于全局硬上限（全局那个只约束下级子代理）。"
+          }
+        }
+      },
+      "coordinator_timeout": {
+        "type": "integer",
+        "name": "Task Timeout (s)",
+        "default": 900,
+        "hint": "Total timeout per coordinator task. Default 15 min, since it serially waits for many lower-level sub-agents.",
+        "locales": {
+          "zh": {
+            "name": "任务超时(秒)",
+            "hint": "协调者任务总超时。默认 15 分钟，因为它要串行等待多个下级子代理跑完。"
+          }
+        }
+      },
+      "coordinator_context_minutes": {
+        "type": "integer",
+        "name": "Context Retention (min)",
+        "default": 60,
+        "hint": "How long a finished coordinator task keeps its context for follow-up conversation (resume).",
+        "locales": {
+          "zh": {
+            "name": "现场保留时长(分钟)",
+            "hint": "协调者任务结束后现场保留多久，供二次沟通（resume 继续对话）。"
+          }
+        }
+      },
+      "coordinator_save_spawned": {
+        "type": "switch",
+        "name": "Save Spawned Sub-agents",
+        "default": false,
+        "hint": "Whether sub-agents created by a coordinator are saved as webui personas. OFF (default) = memory-only, gone after restart; ON = persisted like LLM-created ones (source: coordinator).",
+        "locales": {
+          "zh": {
+            "name": "保存协调者创建的下级",
+            "hint": "协调者创建的下级子代理是否保存为 webui 人设。关（默认）= 仅内存存在、重启消失；开 = 走现有保存流程持久化（来源记为协调者创建）。"
+          }
+        }
+      }
+    }
+  },
   "section_command": {
     "type": "section",
     "name": "Commands",
@@ -528,11 +639,11 @@
           "/suba",
           "/子代理"
         ],
-        "hint": "Start command prefix(es); append the default-list index, e.g. /suba1 <task>",
+        "hint": "Start command prefix(es); append the list index, e.g. /suba1 <task>. When coordinator is enabled, indices map to the coordinator list (coordinators arrange lower-level sub-agents themselves).",
         "locales": {
           "zh": {
             "name": "启动命令别名",
-            "hint": "启动命令前缀，后接默认列表序号，如 /suba1 任务内容"
+            "hint": "启动命令前缀，后接列表序号，如 /suba1 任务内容。已启用协调者时：序号对应协调者列表，由协调者安排下级子代理。"
           }
         }
       },

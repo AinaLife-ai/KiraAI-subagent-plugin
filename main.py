@@ -2,9 +2,12 @@
 SubAgent plugin for KiraAI
 让主代理能够将任务委派给拥有独立人设、工具集和模型配置的子代理。
 
-v1.0.1 设计要点：
+v1.1.0 设计要点：
 - 异步派发模式：spawn_subagent 立即返回，子代理后台执行，完成后经消息缓冲
   防抖机制"尽力合并"地通知主 LLM 主动向用户汇报（或直接发用户，可配置）
+- 协调者层（可选，默认关）：主 LLM 只把任务交给协调者，协调者异步并行派发
+  下级子代理、用 collect_subagent_results 收集结果；防烂尾三规则
+  （收尾拦截 / 级联取消 / 下级免投递）；人设注册与读取两侧与普通层完全隔离
 - 任务管理：subagent_status / stop_subagent / resume_subagent + 命令双通道
 - 人设系统集成：内置人设自动注册到 webui（重名不覆盖），persona_id 稳定绑定
 - 工具白/黑名单（关键词匹配可开关）、可选模型列表、会话作用域、步数双层限制
@@ -60,6 +63,7 @@ class SubAgentConfig:
     timeout: float = 0.0          # 0 = 用插件默认值
     model: str = ""               # "provider_id:model_id" / "fast" / ""
     tags: str = ""                # 擅长标签提示
+    tier: str = "normal"          # normal | coordinator（协调者：管其他子代理的子代理）
 
 
 @dataclass
@@ -82,10 +86,13 @@ class SubAgentTask:
     handle: Optional[asyncio.Task] = None
     request: object = None        # 保留 LLMRequest 用于 resume
     llm_model: object = None
+    tier: str = "normal"          # normal | coordinator（冗余自 cfg，防 cfg 先被删）
+    parent_task_id: str = ""      # 派出本任务的协调者任务ID（origin=coordinator 时）
+    collected: bool = False       # 结果是否已被协调者 collect 回收
 
 
 # 子代理管理类工具的安全底线：任何情况下子代理自身都不能调用（防递归/防自管理）
-_SOURCE_LABELS = {"builtin": "内置", "persona": "用户人设", "llm": "AI创建"}
+_SOURCE_LABELS = {"builtin": "内置", "persona": "用户人设", "llm": "AI创建", "coordinator": "协调者创建"}
 
 # 子代理最终产出里常裹着框架消息标记 <msg><text>...</text></msg>，
 # 直接投递会原样显示标签，注入主 AI 也会带噪音。只剥这两个容器标签，
@@ -215,6 +222,9 @@ def _extract_file_elements(text: str):
 
 # 子代理任务上下文标记（contextvar：异步任务间隔离，主 AI 的日志不受影响）
 _IN_SUBAGENT = contextvars.ContextVar("kira_subagent_ctx", default=False)
+# 当前正在执行的子代理任务（仅子代理任务协程内有值；主 LLM 上下文为 None）。
+# 工具据此判断调用者是主 LLM / 协调者 / 普通子代理，实现两层层级管控。
+_CURRENT_TASK: contextvars.ContextVar = contextvars.ContextVar("kira_subagent_current_task", default=None)
 _QUIET_STATE = {"enabled": True}   # 由 _load_cfg 根据开关刷新
 _FILTER_ATTACHED = {"done": False}
 
@@ -268,7 +278,12 @@ class _SubagentLLMShim:
             if tool_set and name in tool_set:
                 try:
                     coro = tool_set.get(name).execute(event, **args)
-                    result = await asyncio.wait_for(coro, timeout)
+                    if name == "collect_subagent_results":
+                        # collect 要阻塞等下级跑完（可能远超单次工具超时），
+                        # 不受 sub_tool_timeout 约束；上限由协调者任务总超时兜底
+                        result = await coro
+                    else:
+                        result = await asyncio.wait_for(coro, timeout)
                 except asyncio.TimeoutError:
                     result = {"error": f"Tool '{name}' timed out after {timeout}s (subagent limit)"}
                     tool_logger.error(f"Tool '{name}' timed out after {timeout}s (subagent limit)")
@@ -311,6 +326,15 @@ _SAFETY_BOTTOM = {
     "call_subagent", "spawn_subagent", "register_subagent", "edit_subagent",
     "remove_subagent", "list_subagents", "subagent_status", "stop_subagent",
     "resume_subagent", "get_subagent_persona", "save_subagent_persona",
+    "collect_subagent_results",
+}
+
+# 协调者豁免的管理工具（仍在 _SAFETY_BOTTOM 里，仅协调者 tier 放行）：
+# 派/查/停/续/创建/编辑/收集。不能 remove、不能 call（阻塞自身）、
+# 不能存人设、不能读人设全文；不能派协调者（spawn 里的层级拦截保证）
+_COORDINATOR_TOOLS = {
+    "spawn_subagent", "list_subagents", "subagent_status", "stop_subagent",
+    "resume_subagent", "register_subagent", "edit_subagent", "collect_subagent_results",
 }
 
 _BUILTIN_IDS = {"subagent_code_expert", "subagent_writing_expert"}
@@ -339,6 +363,32 @@ _BUILTIN_PERSONAS = [
     },
 ]
 
+_COORDINATOR_BUILTIN_ID = "subagent_coordinator_planner"
+_COORDINATOR_BUILTIN = {
+    "key": "planner",
+    "persona_id": _COORDINATOR_BUILTIN_ID,
+    "base_name": "子代理-规划师",
+    "tags": "规划 拆解 管理",
+    "content": (
+        "你是「规划师」，一名任务协调者。你不亲自执行具体工作，负责把复杂任务\n"
+        "拆解、分派给下级子代理、跟踪进度并审查结果，直到任务真正完成。\n"
+        "\n"
+        "工作方式：\n"
+        "1. 拆解：把收到的任务拆成若干独立的可执行单元，明确每个单元的交付标准。\n"
+        "2. 分派：用工具把每个单元派给合适的下级子代理（可按需创建新的下级）。\n"
+        "   派活时必须说清：要做什么、交付什么、多少步以内完成。\n"
+        "3. 跟踪：用查询工具跟进进度；下级卡住或失败时调整方案重新派。\n"
+        "4. 审查：关键产物（代码、文档等）应派一个未参与制作的下级做独立审查；\n"
+        "   审查不通过说明原因并返工，直至达标。简单任务可省略审查。\n"
+        "5. 交付：全部完成后，汇总各下级产出，输出最终完整结果。\n"
+        "\n"
+        "规则：\n"
+        "- 只协调，不亲自动手做具体实现。\n"
+        "- 不能跳过交付直接结束；任务未完成就继续安排，直到完成或确认无法完成。\n"
+        "- 若确实无法推进，如实说明：已完成什么、卡在哪、需要什么。"
+    ),
+}
+
 _STUB_ADAPTER = AdapterInfo(
     enabled=True,
     adapter_id="subagent",
@@ -355,6 +405,8 @@ class SubAgentPlugin(BasePlugin):
         super().__init__(ctx, cfg)
         self._configs: dict[str, SubAgentConfig] = {}
         self._default_order: list[str] = []          # 默认子代理列表（来自 default_personas 配置）
+        self._coordinator_order: list[str] = []      # 协调者列表（来自 coordinator_personas 配置）
+        self._coordinator_spawned: set[str] = set()  # 协调者创建的内存级下级（不持久化）
         self._hot_loaded_order: list[str] = []       # 热加载的 AI 创建子代理（命令序号排在默认列表之后）
         self._tasks: dict[str, SubAgentTask] = {}
         self._task_counter = 0
@@ -362,7 +414,7 @@ class SubAgentPlugin(BasePlugin):
         self._session_sems: dict[str, asyncio.Semaphore] = {}
         self._custom_tools_cache: Optional[list[BaseTool]] = None
         self._last_status_query: dict[str, float] = {}   # sid -> 上次查询时间
-        self._store: dict = {"persona_map": {}, "saved": {}}
+        self._store: dict = {"persona_map": {}, "saved": {}, "coordinator_persona_map": {}}
         self._store_path: Optional[Path] = None
 
     # ------------------------------------------------------------------
@@ -435,6 +487,22 @@ class SubAgentPlugin(BasePlugin):
         r = c.get("section_resume", {})
         self.allow_resume = bool(r.get("allow_resume", True))
         self.resume_keep_minutes = int(r.get("resume_keep_minutes", 30))
+
+        co = c.get("section_coordinator", {})
+        # 协调者总开关（默认关）：开启后主 LLM 只把任务交给协调者，由它分派下级子代理
+        self.enable_coordinator = bool(co.get("enable_coordinator", False))
+        self.coordinator_personas_raw = [s for s in co.get("coordinator_personas", [
+            "子代理-规划师;规划 拆解 管理",
+        ]) if str(s).strip()]
+        # 协调者可用模型列表（格式同 available_models；留空回退 available_models）
+        self.coordinator_models_raw = [s for s in co.get("coordinator_models", []) if str(s).strip()]
+        self.coordinator_models = self._parse_model_list(self.coordinator_models_raw)
+        self.coordinator_default_steps = int(co.get("coordinator_default_steps", 25))
+        # 协调者步数硬上限独立于全局 max_steps_limit（全局那个只约束下级子代理）
+        self.coordinator_max_steps_limit = int(co.get("coordinator_max_steps_limit", 50))
+        self.coordinator_timeout = float(co.get("coordinator_timeout", 900))
+        self.coordinator_context_minutes = int(co.get("coordinator_context_minutes", 60))
+        self.coordinator_save_spawned = bool(co.get("coordinator_save_spawned", False))
 
         cmd = c.get("section_command", {})
         self.enable_commands = bool(cmd.get("enable_commands", False))
@@ -518,6 +586,7 @@ class SubAgentPlugin(BasePlugin):
                     self._store = json.loads(self._store_path.read_text(encoding="utf-8"))
                     self._store.setdefault("persona_map", {})
                     self._store.setdefault("saved", {})
+                    self._store.setdefault("coordinator_persona_map", {})
         except Exception as e:
             sub_logger.error(f"[subagent] 读取 subagents.json 失败: {e}")
 
@@ -565,11 +634,14 @@ class SubAgentPlugin(BasePlugin):
 
         await self._ensure_builtin_personas()
         await self._load_default_personas()
+        await self._load_coordinator_personas()
         await self._load_saved_subagents()
 
         sub_logger.info(
             f"SubAgent plugin loaded. subagents={list(self._configs.keys())}, "
-            f"default_order={self._default_order}, mode={self.call_mode}/{self.result_delivery}"
+            f"default_order={self._default_order}, coordinators={self._coordinator_order}, "
+            f"coordinator={'开' if self.enable_coordinator else '关'}, "
+            f"mode={self.call_mode}/{self.result_delivery}"
         )
 
     async def terminate(self):
@@ -578,6 +650,8 @@ class SubAgentPlugin(BasePlugin):
                 t.handle.cancel()
         self._configs.clear()
         self._default_order.clear()
+        self._coordinator_order.clear()
+        self._coordinator_spawned.clear()
         self._tasks.clear()
         self._last_status_query.clear()
         self._custom_tools_cache = None
@@ -594,7 +668,6 @@ class SubAgentPlugin(BasePlugin):
     async def _ensure_builtin_personas(self):
         """把内置子代理人设注册到 webui 人设库。重名不覆盖；已删除不重建（策略A）。"""
         persona_mgr = self.ctx.persona_mgr
-        pmap = self._store["persona_map"]
         try:
             existing = await persona_mgr.list_personas()
         except Exception as e:
@@ -602,7 +675,11 @@ class SubAgentPlugin(BasePlugin):
             return
         existing_names = {p.name for p in existing}
 
-        for bp in _BUILTIN_PERSONAS:
+        # 普通内置人设记入 persona_map；协调者（规划师）记入独立的
+        # coordinator_persona_map，与普通子代理层在注册/读取两侧完全隔离。
+        # 协调者人设无论开关与否都注册：开关只控制可用性，用户可在 webui 看到并修改
+        for bp, pmap in [(b, self._store["persona_map"]) for b in _BUILTIN_PERSONAS] \
+                + [(_COORDINATOR_BUILTIN, self._store.setdefault("coordinator_persona_map", {}))]:
             pid = bp["persona_id"]
             pmap.setdefault(bp["key"], pid)
             cur = await persona_mgr.get_persona(pid)
@@ -671,6 +748,12 @@ class SubAgentPlugin(BasePlugin):
             if not target:
                 sub_logger.warning(f"[subagent] default_personas 中的人设「{pname}」不存在，已跳过")
                 continue
+            if target.id == _COORDINATOR_BUILTIN_ID:
+                # 隔离：协调者人设不会被普通层 default_personas 拉走
+                sub_logger.warning(
+                    f"[subagent] default_personas 中的「{pname}」是协调者人设，"
+                    f"请改配到 coordinator_personas，已跳过")
+                continue
 
             sid_ = target.id  # subagent_id 直接使用 persona_id，稳定且唯一
             saved_override = self._store["saved"].get(sid_, {})
@@ -695,11 +778,77 @@ class SubAgentPlugin(BasePlugin):
             if sid_ not in self._default_order:
                 self._default_order.append(sid_)
 
+    async def _load_coordinator_personas(self):
+        """按 coordinator_personas 配置加载协调者（独立于默认子代理列表）。
+        开关关闭时不加载：协调者人设即使在 webui 人设库里也不出现在任何可用列表。"""
+        if not self.enable_coordinator:
+            return
+        persona_mgr = self.ctx.persona_mgr
+        pmap = self._store.setdefault("coordinator_persona_map", {})
+        try:
+            all_personas = await persona_mgr.list_personas()
+        except Exception as e:
+            sub_logger.error(f"[subagent] 无法列出人设: {e}")
+            return
+        by_name = {p.name: p for p in all_personas}
+        by_id = {p.id: p for p in all_personas}
+
+        for line in self.coordinator_personas_raw:
+            parts = [s.strip() for s in str(line).split(";")]
+            pname, tags = parts[0], (parts[1] if len(parts) > 1 else "")
+            if not pname:
+                continue
+            # 解析顺序与普通层一致（缓存id → id匹配 → 名称匹配），
+            # 内置兜底只认规划师（协调者层专属，不吃普通层的内置人设）
+            target = None
+            cached_id = pmap.get(pname)
+            if cached_id and cached_id in by_id:
+                target = by_id[cached_id]
+            elif pname in by_id:
+                target = by_id[pname]
+            else:
+                if pname == _COORDINATOR_BUILTIN["base_name"] and _COORDINATOR_BUILTIN_ID in by_id:
+                    target = by_id[_COORDINATOR_BUILTIN_ID]
+                if not target and pname in by_name:
+                    target = by_name[pname]
+                    pmap[pname] = target.id  # 缓存解析结果
+                    self._store_save()
+            if not target:
+                sub_logger.warning(f"[subagent] coordinator_personas 中的人设「{pname}」不存在，已跳过")
+                continue
+
+            sid_ = target.id
+            saved_override = self._store["saved"].get(sid_, {})
+            cfg = SubAgentConfig(
+                subagent_id=sid_,
+                name=target.name or pname,
+                description=saved_override.get("description") or (f"擅长：{tags}" if tags else f"基于人设「{target.name}」的协调者"),
+                persona=target.content or "",
+                persona_id=target.id,
+                source="builtin" if sid_ == _COORDINATOR_BUILTIN_ID else "persona",
+                tools=saved_override.get("tools", []),
+                max_steps=int(saved_override.get("max_steps", 0)),
+                timeout=float(saved_override.get("timeout", 0.0)),
+                model=saved_override.get("model", ""),
+                tags=tags,
+                tier="coordinator",
+            )
+            self._configs[sid_] = cfg
+            if sid_ not in self._coordinator_order:
+                self._coordinator_order.append(sid_)
+        if not self._coordinator_order:
+            sub_logger.warning(
+                "[subagent] 协调者已启用但 coordinator_personas 没有可用项，主 LLM 将无协调者可派")
+
     async def _load_saved_subagents(self):
         """恢复 LLM 创建并保存的子代理（持久化在 store 中）。绑定人设的以 webui 实时内容为准。"""
         migrated = False
         for said, rec in self._store["saved"].items():
             if said in self._configs:
+                continue
+            # 隔离：协调者的存档/覆盖记录不进入普通子代理层；
+            # 协调者开关关闭时其记录也不恢复（整层不可见）
+            if rec.get("tier") == "coordinator" or said == _COORDINATOR_BUILTIN_ID:
                 continue
             persona_text = rec.get("persona", "")
             pid = rec.get("persona_id", "")
@@ -751,6 +900,7 @@ class SubAgentPlugin(BasePlugin):
             "timeout": cfg.timeout,
             "model": cfg.model,
             "tags": cfg.tags,
+            "tier": cfg.tier,
         }
         self._store_save()
 
@@ -769,11 +919,12 @@ class SubAgentPlugin(BasePlugin):
             self._dbg("会话 %s 不在启用名单内，已忽略", sid)
         return ok
 
-    def _models_hint_text(self) -> str:
-        if not self.available_models:
+    def _models_hint_text(self, tier: str = "normal") -> str:
+        entries = self.coordinator_models if (tier == "coordinator" and self.coordinator_models) else self.available_models
+        if not entries:
             return f"fast（webui 快速模型: {self._fast_model_label()}）"
         lines = [f"{m['provider']}:{m['model']}" + (f"（擅长: {m['hint']}）" if m["hint"] else "")
-                 for m in self.available_models]
+                 for m in entries]
         return "; ".join(lines)
 
     def _fast_model_label(self) -> str:
@@ -790,9 +941,10 @@ class SubAgentPlugin(BasePlugin):
             pass
         return "（无法识别，请到 webui 模型配置里查看）"
 
-    def _resolve_model(self, model_str: str):
-        """返回 (LLMModelClient | None, error_msg | None)。"""
-        entries = self.available_models
+    def _resolve_model(self, model_str: str, tier: str = "normal"):
+        """返回 (LLMModelClient | None, error_msg | None)。
+        协调者优先用独立的 coordinator_models（未填则回退 available_models）。"""
+        entries = self.coordinator_models if (tier == "coordinator" and self.coordinator_models) else self.available_models
         if not model_str:
             if not entries:
                 client = self.ctx.get_default_fast_llm_client()
@@ -824,9 +976,12 @@ class SubAgentPlugin(BasePlugin):
                 return True
         return False
 
-    def _sub_tool_allowed(self, name: str) -> bool:
+    def _sub_tool_allowed(self, name: str, cfg: "SubAgentConfig | None" = None) -> bool:
         if name in _SAFETY_BOTTOM:
-            return False
+            # 协调者豁免部分管理工具（派/查/停/续/创建/编辑/收集）；
+            # remove / call / 存人设 / 读人设全文 仍全禁
+            if not (cfg is not None and cfg.tier == "coordinator" and name in _COORDINATOR_TOOLS):
+                return False
         if self.tool_whitelist and not self._name_in(name, self.tool_whitelist):
             return False
         if self.tool_blacklist and self._name_in(name, self.tool_blacklist):
@@ -861,7 +1016,7 @@ class SubAgentPlugin(BasePlugin):
         full_set = self.ctx.llm_api.build_tool_set()
         tool_set = ToolSet()
         for tool in full_set.tools:
-            if not self._sub_tool_allowed(tool.name):
+            if not self._sub_tool_allowed(tool.name, cfg):
                 continue
             if cfg.tools and not self._name_in(tool.name, cfg.tools):
                 continue
@@ -869,7 +1024,7 @@ class SubAgentPlugin(BasePlugin):
                 tool = self._wrap_non_blocking(tool)
             tool_set.add(tool)
         for ct in self._custom_tools():
-            if self._sub_tool_allowed(ct.name) and (not cfg.tools or self._name_in(ct.name, cfg.tools)):
+            if self._sub_tool_allowed(ct.name, cfg) and (not cfg.tools or self._name_in(ct.name, cfg.tools)):
                 tool_set.add(ct)
         return tool_set
 
@@ -980,14 +1135,28 @@ class SubAgentPlugin(BasePlugin):
             messages=[dummy_msg],
         )
 
-    def _subagent_brief(self, tool_set: ToolSet) -> str:
-        base = (
-            "你是一个专门的子代理(sub-agent)，由主代理委派完成特定子任务。"
-            "专注于被委派的任务，完成后直接用纯文本输出最终结果，"
-            "不要使用 XML 标签或消息格式（唯一例外：生成的文件/图片可在结果末尾用 "
-            "<file type=\"image\">路径</file> 附上，会被真正发送），"
-            "不要输出与任务无关的元评论。"
-        )
+    def _subagent_brief(self, tool_set: ToolSet, cfg: "SubAgentConfig | None" = None) -> str:
+        if cfg is not None and cfg.tier == "coordinator":
+            base = (
+                "你是一名协调者(coordinator)，负责拆解复杂任务并分派给下级子代理完成，"
+                "不亲自做具体实现。工作方式："
+                "用 spawn_subagent 异步派出下级（立即返回任务ID；一步内可连发多个，下级并行运行），"
+                "随后用 collect_subagent_results 等待并一次性收集它们的结果；"
+                "可用 subagent_status / stop_subagent / resume_subagent 跟踪管理，"
+                "可用 register_subagent / edit_subagent 创建或调整下级。"
+                "你不能派出协调者，不能删除子代理。"
+                "所有下级交付前你不能结束任务（系统会拦截）；全部完成后汇总输出最终结果，"
+                "不要使用 XML 标签或消息格式（唯一例外：生成的文件/图片可在结果末尾用 "
+                "<file type=\"image\">路径</file> 附上）。"
+            )
+        else:
+            base = (
+                "你是一个专门的子代理(sub-agent)，由主代理委派完成特定子任务。"
+                "专注于被委派的任务，完成后直接用纯文本输出最终结果，"
+                "不要使用 XML 标签或消息格式（唯一例外：生成的文件/图片可在结果末尾用 "
+                "<file type=\"image\">路径</file> 附上，会被真正发送），"
+                "不要输出与任务无关的元评论。"
+            )
         if not self.inject_framework_brief:
             return base
         tool_names = [t.name for t in tool_set.tools]
@@ -999,8 +1168,8 @@ class SubAgentPlugin(BasePlugin):
             + "若任务无法完全完成，最后一条回复必须说明：已完成的部分、当前进展、卡点。"
         )
 
-    def _apply_llm_steps(self, value) -> int:
-        """主 LLM 提供的步数：应用最小步数地板，再受硬上限约束。返回 0 表示"未设置"。"""
+    def _apply_llm_steps(self, value, tier: str = "normal") -> int:
+        """LLM 提供的步数：应用最小步数地板，再受对应层级硬上限约束。返回 0 表示"未设置"。"""
         try:
             v = int(value or 0)
         except (TypeError, ValueError):
@@ -1009,9 +1178,13 @@ class SubAgentPlugin(BasePlugin):
             return 0
         if self.min_llm_steps > 0:
             v = max(v, self.min_llm_steps)
-        return min(v, self.max_steps_limit)
+        limit = self.coordinator_max_steps_limit if tier == "coordinator" else self.max_steps_limit
+        return min(v, limit)
 
     def _effective_steps(self, cfg: SubAgentConfig) -> int:
+        if cfg.tier == "coordinator":
+            # 协调者步数独立：默认值与硬上限都不吃全局 max_steps_limit（那个只约束下级）
+            return min(cfg.max_steps or self.coordinator_default_steps, self.coordinator_max_steps_limit)
         return min(cfg.max_steps or self.default_max_steps, self.max_steps_limit)
 
     _TPL_KEYS = ("name", "task_id", "task", "result", "status", "index", "total", "count", "list")
@@ -1027,6 +1200,8 @@ class SubAgentPlugin(BasePlugin):
             return str(tpl)
 
     def _effective_timeout(self, cfg: SubAgentConfig) -> float:
+        if cfg.tier == "coordinator":
+            return cfg.timeout if cfg.timeout > 0 else self.coordinator_timeout
         return cfg.timeout if cfg.timeout > 0 else self.default_timeout
 
     async def _dsml_rescue(self, task: SubAgentTask, text: str,
@@ -1061,7 +1236,7 @@ class SubAgentPlugin(BasePlugin):
         return cleaned or text
 
     async def _execute_subagent(self, task: SubAgentTask, cfg: SubAgentConfig,
-                                resume: bool = False) -> str:
+                                resume: bool = False, _abandon_retries: int = 0) -> str:
         tool_set = self._build_tool_set(cfg)
         executor = AgentExecutor(
             _SubagentLLMShim(self.ctx.llm_api, self.sub_tool_timeout), tool_set)
@@ -1076,7 +1251,7 @@ class SubAgentPlugin(BasePlugin):
             request = LLMRequest(messages=[], tool_set=tool_set)
             if cfg.persona:
                 request.system_prompt.append(Prompt(cfg.persona, name="persona", source="system"))
-            request.system_prompt.append(Prompt(self._subagent_brief(tool_set), name="subagent_role", source="system"))
+            request.system_prompt.append(Prompt(self._subagent_brief(tool_set, cfg), name="subagent_role", source="system"))
             request.user_prompt.append(Prompt(task.task_text, name="task", source="user"))
             request.assemble_prompt()
 
@@ -1085,7 +1260,7 @@ class SubAgentPlugin(BasePlugin):
             sub_logger.info(
                 "[调试] 子代理 %s(%s) 完整请求:\n--- 人设 ---\n%s\n--- 系统简报 ---\n%s\n--- 任务 ---\n%s\n--- 可用工具: %s",
                 task.name, task.task_id, cfg.persona or "（无）",
-                self._subagent_brief(tool_set), task.task_text,
+                self._subagent_brief(tool_set, cfg), task.task_text,
                 ", ".join(t.name for t in tool_set.tools) or "（无）")
         stub_event = self._make_stub_event(task.sid)
         agent_ctx = AgentExecutionContext(
@@ -1118,6 +1293,25 @@ class SubAgentPlugin(BasePlugin):
 
         if self.dsml_rescue and final_text and "DSML" in final_text:
             final_text = await self._dsml_rescue(task, final_text, tool_set, stub_event)
+
+        # 防烂尾规则1：协调者收尾时仍有未交付下级 → 注入提示强制继续（最多追加 3 轮，
+        # 全程仍在任务总超时内）。走 resume 路径复用现有请求上下文，注入消息留在历史里
+        if cfg.tier == "coordinator" and _abandon_retries < 3:
+            pending = self._unfinished_children(task)
+            if pending:
+                ids = "、".join(f"{t.task_id}({t.name} {t.state})" for t in pending)
+                sub_logger.info(
+                    f"[subagent] 协调者任务 {task.task_id} 试图收尾但仍有 "
+                    f"{len(pending)} 个未交付下级，强制继续")
+                task.task_text = (
+                    f"（系统：你还有 {len(pending)} 个下级子代理未交付结果：{ids}。"
+                    f"现在不能结束任务。请用 collect_subagent_results 等待并收集它们的结果，"
+                    f"或用 stop_subagent 明确放弃不需要的下级，"
+                    f"然后汇总所有产出，输出最终完整结果。）"
+                )
+                more = await self._execute_subagent(
+                    task, cfg, resume=True, _abandon_retries=_abandon_retries + 1)
+                final_text = more or final_text
 
         if not final_text.strip() and self.force_final_report:
             final_text = await self._wrap_up(task, "步数已用尽但未产出最终结果")
@@ -1196,6 +1390,19 @@ class SubAgentPlugin(BasePlugin):
     # 任务生命周期
     # ------------------------------------------------------------------
 
+    def _unfinished_children(self, task: SubAgentTask) -> list[SubAgentTask]:
+        """协调者尚未交付的下级：在跑的 + 已结束但未被 collect 回收的（stopped 视为已放弃）。"""
+        return [t for t in self._tasks.values()
+                if t.parent_task_id == task.task_id and not t.collected
+                and t.state in ("queued", "running", "done", "timeout", "error")]
+
+    def _cancel_children(self, task: SubAgentTask):
+        """防烂尾规则2：协调者结束（完成/停止/超时/出错）时级联取消其仍在跑的下级。"""
+        for t in list(self._tasks.values()):
+            if t.parent_task_id == task.task_id and t.state in ("queued", "running"):
+                self._dbg("级联取消协调者 %s 的下级任务 %s", task.task_id, t.task_id)
+                self._stop_task(t)
+
     def _next_task_id(self) -> str:
         self._task_counter += 1
         return f"t{self._task_counter}"
@@ -1207,7 +1414,7 @@ class SubAgentPlugin(BasePlugin):
         return self._session_sems[sid]
 
     def _spawn(self, cfg: SubAgentConfig, sid: str, origin: str, task_text: str,
-               llm_model, steps_override: int = 0) -> SubAgentTask:
+               llm_model, steps_override: int = 0, parent_task_id: str = "") -> SubAgentTask:
         task = SubAgentTask(
             task_id=self._next_task_id(),
             subagent_id=cfg.subagent_id,
@@ -1218,6 +1425,8 @@ class SubAgentPlugin(BasePlugin):
             created_at=time.time(),
             llm_model=llm_model,
             max_steps=steps_override or self._effective_steps(cfg),
+            tier=cfg.tier,
+            parent_task_id=parent_task_id,
         )
         task.handle = asyncio.create_task(self._task_runner(task, cfg))
         self._tasks[task.task_id] = task
@@ -1228,6 +1437,7 @@ class SubAgentPlugin(BasePlugin):
 
     async def _task_runner(self, task: SubAgentTask, cfg: SubAgentConfig, resume: bool = False):
         _ctx_token = _IN_SUBAGENT.set(True)   # 标记子代理上下文，静默框架过程日志
+        _task_token = _CURRENT_TASK.set(task)  # 标记当前任务（工具据此识别调用者层级）
         try:
             async with self._sem:
                 async with self._session_sem(task.sid):
@@ -1260,12 +1470,16 @@ class SubAgentPlugin(BasePlugin):
                             task.result = f"执行出错：{e}"
                         task.state = "error"
             task.finished_at = time.time()
+            if cfg.tier == "coordinator":
+                self._cancel_children(task)   # 防烂尾规则2：级联取消漏网下级
             await self._deliver_result(task)
             self._schedule_task_cleanup(task)
         except asyncio.CancelledError:
             # 手动停止（含排队等信号量期间被取消的情况）
             task.state = "stopped"
             task.finished_at = time.time()
+            if cfg.tier == "coordinator":
+                self._cancel_children(task)   # 协调者被停止 → 级联取消其下级
             try:
                 await self._after_stopped(task)
             except Exception as e:
@@ -1274,10 +1488,15 @@ class SubAgentPlugin(BasePlugin):
         except Exception as e:
             sub_logger.error(f"[subagent] 任务 {task.task_id} 运行器异常: {e}")
         finally:
+            _CURRENT_TASK.reset(_task_token)
             _IN_SUBAGENT.reset(_ctx_token)
 
     async def _deliver_result(self, task: SubAgentTask):
         """完成投递：命令式且开关关闭 → 直接发用户；否则经缓冲防抖机制通知主 LLM 汇报。"""
+        if task.origin == "coordinator":
+            # 防烂尾规则3：协调者派出的下级不做正常投递（不通知用户/主 LLM），
+            # 结果只经 collect_subagent_results 回流给协调者
+            return
         # <file> 里的 data URI 先落盘成真文件（两条投递路径都能发真附件）
         if task.result:
             task.result = _resolve_data_uri_files(task.result, task.task_id)
@@ -1338,7 +1557,9 @@ class SubAgentPlugin(BasePlugin):
         """已结束任务保留一段时间（供查询/resume），过期清理。"""
         if task.state in ("queued", "running"):
             return
-        keep = max(self.resume_keep_minutes, 1) * 60
+        # 协调者现场保留独立时长（二次沟通窗口），普通任务用 resume_keep_minutes
+        minutes = self.coordinator_context_minutes if task.tier == "coordinator" else self.resume_keep_minutes
+        keep = max(minutes, 1) * 60
 
         async def _gc():
             await asyncio.sleep(keep)
@@ -1385,7 +1606,7 @@ class SubAgentPlugin(BasePlugin):
 
     @register.tool(
         name="list_subagents",
-        description="列出所有已注册的子代理(subagent)及其状态、可用模型列表。可传 keyword（任务关键词）模糊匹配最合适的子代理，便于精准分配任务。",
+        description="列出当前你可见的子代理(subagent)及其状态、可用模型列表。可传 keyword（任务关键词）模糊匹配最合适的子代理，便于精准分配任务。若已启用协调者：主代理只看到协调者，协调者只看到下级子代理。",
         params={
             "type": "object",
             "properties": {
@@ -1399,7 +1620,18 @@ class SubAgentPlugin(BasePlugin):
             return "当前会话未启用子代理功能。"
         if not self._configs:
             return "当前没有已注册的子代理。"
-        configs = self._match_subagents(keyword)
+        caller = _CURRENT_TASK.get(None)
+        if self.enable_coordinator:
+            if caller is None:
+                # 主 LLM 只见协调者（下级由协调者自行安排）
+                configs = [c for c in self._match_subagents(keyword) if c.tier == "coordinator"]
+                if not configs and not keyword:
+                    return "当前没有可用的协调者，请在插件设置的 coordinator_personas 中配置。"
+            else:
+                # 协调者只见普通下级（含它自己创建的内存级下级）
+                configs = [c for c in self._match_subagents(keyword) if c.tier != "coordinator"]
+        else:
+            configs = [c for c in self._match_subagents(keyword) if c.tier != "coordinator"]
         if not configs:
             return f"没有匹配「{keyword}」的子代理。请换个关键词，或不传关键词查看全部。"
         lines = []
@@ -1407,12 +1639,13 @@ class SubAgentPlugin(BasePlugin):
             lines.append(f"匹配「{keyword}」的子代理（按相关度排序）:")
         for cfg in configs:
             cid = cfg.subagent_id
-            default_mark = ("（默认）" if cid in self._default_order
+            default_mark = ("（协调者）" if cfg.tier == "coordinator"
+                            else "（默认）" if cid in self._default_order
                             else "（热加载）" if cid in self._hot_loaded_order else "")
             model_str = cfg.model or ("列表首选" if self.available_models else "fast")
             lines.append(
                 f"[{cid}] {cfg.name}{default_mark} 来源:{_source_label(cfg.source)} — {cfg.description}\n"
-                f"    步数:{cfg.max_steps or self.default_max_steps}(上限{self.max_steps_limit}) "
+                f"    步数:{self._effective_steps(cfg)}(上限{self.coordinator_max_steps_limit if cfg.tier == 'coordinator' else self.max_steps_limit}) "
                 f"超时:{self._effective_timeout(cfg):.0f}s 模型:{model_str} "
                 f"工具:{'限定 ' + ','.join(cfg.tools) if cfg.tools else '按插件黑白名单'}"
             )
@@ -1426,7 +1659,9 @@ class SubAgentPlugin(BasePlugin):
             lines.append("正在运行的任务: " + ", ".join(
                 f"{t.task_id}({t.name} {t.state} {t.current_step}/{t.max_steps}步)" for t in running
             ))
-        lines.append(f"可选模型: {self._models_hint_text()}")
+        # 主 LLM 看协调者列表 → 展示协调者模型；协调者看下级列表 → 展示下级模型
+        hint_tier = "coordinator" if (caller is None and self.enable_coordinator) else "normal"
+        lines.append(f"可选模型: {self._models_hint_text(hint_tier)}")
         header = "" if keyword else "已注册的子代理:\n"
         return header + "\n".join(lines)
 
@@ -1457,7 +1692,9 @@ class SubAgentPlugin(BasePlugin):
                                      save_persona: bool = False) -> str:
         if not self._in_scope(event.sid):
             return "当前会话未启用子代理功能。"
-        if not self.allow_llm_create:
+        caller = _CURRENT_TASK.get(None)
+        by_coordinator = caller is not None and caller.tier == "coordinator"
+        if not by_coordinator and not self.allow_llm_create:
             return "错误: 当前配置不允许主代理创建子代理。"
         if subagent_id in self._configs:
             return f"错误: 子代理 '{subagent_id}' 已存在，请换一个 ID。"
@@ -1468,6 +1705,8 @@ class SubAgentPlugin(BasePlugin):
         # 保留策略：llm_decide_save 开 → 由主 LLM 通过 save_persona 决定；
         # 关 → 全部自动保存。二者都受总开关 allow_llm_save 约束。
         want_save = save_persona if self.llm_decide_save else True
+        if by_coordinator and not self.coordinator_save_spawned:
+            want_save = False  # 协调者创建的下级仅内存存在（开关控制），不持久化
         persona_id = ""
         save_note = ""
         if want_save:
@@ -1479,11 +1718,17 @@ class SubAgentPlugin(BasePlugin):
                 persona_id = await self._save_as_persona(subagent_id, name, persona)
         cfg = SubAgentConfig(
             subagent_id=subagent_id, name=name, description=description, persona=persona,
-            persona_id=persona_id, source="llm", tools=tools or [],
+            persona_id=persona_id, source="coordinator" if by_coordinator else "llm",
+            tools=tools or [],
             max_steps=self._apply_llm_steps(max_steps),
             timeout=min(max(float(timeout), 0.0), 3600.0), model=model,  # LLM 传参硬钳制
         )
         self._configs[subagent_id] = cfg
+        if by_coordinator and not self.coordinator_save_spawned:
+            # 内存级下级：不进 store、不进命令序号，重启即消失
+            self._coordinator_spawned.add(subagent_id)
+            sub_logger.info(f"Coordinator spawned in-memory sub-agent: {subagent_id} ({name})")
+            return f"子代理 '{subagent_id}' ({name}) 注册成功（协调者创建，仅本次运行有效，未持久化）！"
         self._persist_saved(cfg)  # 持久化，重启不丢
         if persona_id and self.hot_reload_saved and subagent_id not in self._hot_loaded_order and subagent_id not in self._default_order:
             self._hot_loaded_order.append(subagent_id)
@@ -1573,7 +1818,7 @@ class SubAgentPlugin(BasePlugin):
         if config.source == "builtin" and persona is not None:
             return f"错误: '{subagent_id}' 是内置子代理，请在 webui 人设界面修改其人设内容。"
         if model:
-            _, err = self._resolve_model(model)
+            _, err = self._resolve_model(model, config.tier)
             if err:
                 return f"错误: {err}"
         if name is not None:
@@ -1585,7 +1830,7 @@ class SubAgentPlugin(BasePlugin):
         if tools is not None:
             config.tools = tools
         if max_steps is not None:
-            config.max_steps = self._apply_llm_steps(max_steps)
+            config.max_steps = self._apply_llm_steps(max_steps, config.tier)
         if timeout is not None:
             config.timeout = min(max(float(timeout), 0.0), 3600.0)  # LLM 传参硬钳制
         if model is not None:
@@ -1612,6 +1857,8 @@ class SubAgentPlugin(BasePlugin):
         cfg = self._configs.get(subagent_id)
         if not cfg:
             return f"错误: 子代理 '{subagent_id}' 不存在。"
+        if cfg.tier == "coordinator":
+            return f"错误: '{subagent_id}' 是协调者，不可删除（可在插件设置 coordinator_personas 中移除）。"
         if cfg.source == "builtin":
             return f"错误: '{subagent_id}' 是内置子代理，不可删除（可在插件设置 default_personas 中移除）。"
         del self._configs[subagent_id]
@@ -1658,7 +1905,7 @@ class SubAgentPlugin(BasePlugin):
 
     @register.tool(
         name="spawn_subagent",
-        description="异步派出一个子代理执行子任务：立即返回任务ID，子代理在后台运行，完成后系统会通知你结果（你再向用户汇报）。适合耗时或需专业能力的子任务。可用 list_subagents 查看可用子代理。",
+        description="异步派出一个子代理执行子任务：立即返回任务ID，子代理在后台运行，完成后系统会通知你结果（你再向用户汇报）。适合耗时或需专业能力的子任务。可用 list_subagents 查看可用子代理。若已启用协调者：你只能派出协调者，由它拆解任务；协调者用本工具可一步内连派多个下级并行执行，再用 collect_subagent_results 收集结果。",
         params={
             "type": "object",
             "properties": {
@@ -1677,15 +1924,77 @@ class SubAgentPlugin(BasePlugin):
         cfg = self._configs.get(subagent_id)
         if not cfg:
             return f"错误: 子代理 '{subagent_id}' 不存在。可用 list_subagents 查看。"
-        llm_model, err = self._resolve_model(model or cfg.model)
+        # 两层级管控：主 LLM（无任务上下文）只能派协调者；协调者只能派普通下级；
+        # 普通子代理根本拿不到本工具（_SAFETY_BOTTOM），此处防御性兜底
+        caller = _CURRENT_TASK.get(None)
+        origin, parent_task_id = "tool", ""
+        if self.enable_coordinator:
+            if caller is None:
+                if cfg.tier != "coordinator":
+                    coords = "、".join(
+                        f"{c.name}[{c.subagent_id}]" for c in self._configs.values()
+                        if c.tier == "coordinator") or "（无）"
+                    return (f"错误: 已启用协调者，你只能把任务交给协调者，由它拆解并安排下级子代理。"
+                            f"可用协调者: {coords}")
+            elif caller.tier == "coordinator":
+                if cfg.tier == "coordinator":
+                    return "错误: 协调者不能再派出协调者，请派给下级子代理。"
+                origin, parent_task_id = "coordinator", caller.task_id
+            else:
+                return "错误: 普通子代理不能再派出子代理。"
+        elif cfg.tier == "coordinator":
+            return "错误: 协调者功能未启用（请在插件设置中打开 enable_coordinator）。"
+        llm_model, err = self._resolve_model(model or cfg.model, cfg.tier)
         if err:
             return f"错误: {err}"
-        t = self._spawn(cfg, event.sid, "tool", task, llm_model,
-                        steps_override=self._apply_llm_steps(max_steps))
+        t = self._spawn(cfg, event.sid, origin, task, llm_model,
+                        steps_override=self._apply_llm_steps(max_steps, cfg.tier),
+                        parent_task_id=parent_task_id)
         sub_logger.info(f"Spawned task {t.task_id} ({subagent_id}) in {event.sid}")
+        if origin == "coordinator":
+            return (f"已派出下级子代理「{cfg.name}」（任务ID {t.task_id}，最多 {t.max_steps} 步）。"
+                    f"它会后台并行执行，不会打扰主代理；用 collect_subagent_results 等待并收集结果，"
+                    f"期间可用 subagent_status 查询进度，或用 stop_subagent 放弃。")
         return (f"已派出子代理「{cfg.name}」（任务ID {t.task_id}，最多 {t.max_steps} 步）。"
                 f"它会后台执行，完成后你会收到结果通知；期间可用 subagent_status 查询进度，"
                 f"或用 stop_subagent 停止。")
+
+    @register.tool(
+        name="collect_subagent_results",
+        description="（仅协调者可用）等待你派出的所有未收集下级子代理运行结束，把它们的产出一次性返回给你。派出下级后务必用它收集结果再汇总交付；可传 task_ids 只收集指定下级。",
+        params={
+            "type": "object",
+            "properties": {
+                "task_ids": {"type": "array", "items": {"type": "string"},
+                             "description": "可选，只收集这些任务ID；留空收集全部未收集的下级"},
+            },
+            "required": [],
+        },
+    )
+    async def collect_subagent_results(self, event, task_ids: list[str] | None = None) -> str:
+        caller = _CURRENT_TASK.get(None)
+        if caller is None or caller.tier != "coordinator":
+            return "错误: 该工具仅供协调者使用（主代理派出任务后等系统通知即可，无需收集）。"
+        children = [t for t in self._tasks.values()
+                    if t.parent_task_id == caller.task_id and not t.collected]
+        if task_ids:
+            wanted = set(task_ids)
+            children = [t for t in children if t.task_id in wanted]
+        if not children:
+            return "当前没有未收集的下级任务（可能都已收集、被放弃或尚未派出）。"
+        # 等所有目标下级结束（含排队中的）。不设工具级超时：
+        # 上限由协调者任务总超时（coordinator_timeout）兜底
+        handles = [t.handle for t in children if t.handle and not t.handle.done()]
+        if handles:
+            await asyncio.gather(*handles, return_exceptions=True)
+        parts = []
+        for t in children:
+            if t.collected:
+                continue
+            t.collected = True
+            body = t.result or t.error or t.last_step_summary or "（无产出）"
+            parts.append(f"── 下级 {t.task_id}（{t.name}，状态 {t.state}）──\n{body}")
+        return "已收集 {} 个下级结果：\n\n{}".format(len(parts), "\n\n".join(parts))
 
     @register.tool(
         name="call_subagent",
@@ -1706,16 +2015,20 @@ class SubAgentPlugin(BasePlugin):
         cfg = self._configs.get(subagent_id)
         if not cfg:
             return f"Error: SubAgent '{subagent_id}' not found. Available: {list(self._configs.keys())}"
+        if self.enable_coordinator and cfg.tier != "coordinator":
+            return "错误: 已启用协调者，请改用 spawn_subagent 把任务交给协调者，由它拆解并安排下级子代理。"
+        if cfg.tier == "coordinator" and not self.enable_coordinator:
+            return "错误: 协调者功能未启用（请在插件设置中打开 enable_coordinator）。"
         if self.call_mode == "async":
             # 异步模式：同步入口转为派发，避免阻塞主循环
             return await self.spawn_subagent(event, subagent_id, task, model)
-        llm_model, err = self._resolve_model(model or cfg.model)
+        llm_model, err = self._resolve_model(model or cfg.model, cfg.tier)
         if err:
             return f"Error: {err}"
         t = SubAgentTask(
             task_id=self._next_task_id(), subagent_id=cfg.subagent_id, name=cfg.name,
             sid=event.sid, origin="tool", task_text=task, created_at=time.time(),
-            llm_model=llm_model, max_steps=self._effective_steps(cfg),
+            llm_model=llm_model, max_steps=self._effective_steps(cfg), tier=cfg.tier,
         )
         self._tasks[t.task_id] = t
         t.state = "running"
@@ -1767,9 +2080,12 @@ class SubAgentPlugin(BasePlugin):
             if not self._tasks:
                 return "当前没有任何子代理任务记录。"
             lines = []
+            caller = _CURRENT_TASK.get(None)
             for t in self._tasks.values():
                 if t.sid != event.sid:
                     continue  # 会话隔离：不暴露其他会话的任务
+                if caller is not None and caller.tier == "coordinator" and t.parent_task_id != caller.task_id:
+                    continue  # 协调者只能看到自己派出的下级
                 elapsed = int((t.finished_at or time.time()) - t.created_at)
                 lines.append(
                     f"[{t.task_id}] {t.name}({t.subagent_id}) {t.state} "
@@ -1779,6 +2095,9 @@ class SubAgentPlugin(BasePlugin):
         t = self._tasks.get(task_id)
         if not t or t.sid != event.sid:
             return f"错误: 任务 '{task_id}' 不存在或已被清理。"
+        caller = _CURRENT_TASK.get(None)
+        if caller is not None and caller.tier == "coordinator" and t.parent_task_id != caller.task_id:
+            return f"错误: 任务 '{task_id}' 不是你派出的下级。"
         detail = (
             f"任务 {t.task_id}: 子代理 {t.name}({t.subagent_id})\n"
             f"状态: {t.state} | 步数: {t.current_step}/{t.max_steps} | 来源: {t.origin}\n"
@@ -1808,7 +2127,11 @@ class SubAgentPlugin(BasePlugin):
         t = self._tasks.get(task_id)
         if not t or t.sid != event.sid:
             return f"错误: 任务 '{task_id}' 不存在。"
-        if not self._stop_task(t):
+        caller = _CURRENT_TASK.get(None)
+        if caller is not None and caller.tier == "coordinator":
+            if t.parent_task_id != caller.task_id:
+                return f"错误: 任务 '{task_id}' 不是你派出的下级。"
+            t.collected = True  # 明确放弃：不再阻塞协调者收尾
             return f"任务 '{task_id}' 当前状态为 {t.state}，无法停止。"
         progress = f"已停止任务 {task_id}（{t.name}），停在第 {t.current_step}/{t.max_steps} 步。最近: {t.last_step_summary or '—'}"
         if self.allow_resume:
@@ -1835,6 +2158,9 @@ class SubAgentPlugin(BasePlugin):
         t = self._tasks.get(task_id)
         if not t or t.sid != event.sid:
             return f"错误: 任务 '{task_id}' 不存在或已被清理。"
+        caller = _CURRENT_TASK.get(None)
+        if caller is not None and caller.tier == "coordinator" and t.parent_task_id != caller.task_id:
+            return f"错误: 任务 '{task_id}' 不是你派出的下级。"
         if t.state in ("queued", "running"):
             return f"任务 '{task_id}' 正在运行中，无需恢复。"
         if t.request is None or t.llm_model is None:
@@ -1914,7 +2240,11 @@ class SubAgentPlugin(BasePlugin):
         return str(uid) if uid is not None else ""
 
     def _cmd_order(self) -> list[str]:
-        """命令序号对应的完整子代理顺序：默认列表 + （开关允许时）热加载的 AI 子代理。"""
+        """命令序号对应的完整子代理顺序。
+        协调者开启时：序号直接对应协调者列表（普通下级不再接受命令直派）；
+        关闭时：默认列表 + （开关允许时）热加载的 AI 子代理。"""
+        if self.enable_coordinator:
+            return [sid_ for sid_ in self._coordinator_order if sid_ in self._configs]
         order = [sid_ for sid_ in self._default_order if sid_ in self._configs]
         if self.cmd_include_hot_loaded:
             order += [sid_ for sid_ in self._hot_loaded_order
@@ -1947,7 +2277,7 @@ class SubAgentPlugin(BasePlugin):
         if not task_text:
             await self._cmd_reply(event, f"请在命令后加上任务内容，例如：{self.cmd_start_aliases[0]}{index} 帮我审查这段代码")
             return
-        llm_model, err = self._resolve_model(cfg.model)
+        llm_model, err = self._resolve_model(cfg.model, cfg.tier)
         if err:
             await self._cmd_reply(event, f"启动失败：{err}")
             return
