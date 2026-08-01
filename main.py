@@ -15,6 +15,7 @@ v1.1.0 设计要点：
 
 import asyncio
 import base64
+import contextlib
 import contextvars
 import json
 import logging
@@ -1439,8 +1440,13 @@ class SubAgentPlugin(BasePlugin):
         _ctx_token = _IN_SUBAGENT.set(True)   # 标记子代理上下文，静默框架过程日志
         _task_token = _CURRENT_TASK.set(task)  # 标记当前任务（工具据此识别调用者层级）
         try:
-            async with self._sem:
-                async with self._session_sem(task.sid):
+            # 协调者不占并发额度：它大部分时间在 collect 里等下级，
+            # 占着信号量会和自己的下级抢（并发=1 时直接死锁到总超时；
+            # 多个协调者同跑也会占满名额让下级永远排不上）
+            gate = contextlib.AsyncExitStack() if cfg.tier == "coordinator" else self._sem
+            sgate = contextlib.AsyncExitStack() if cfg.tier == "coordinator" else self._session_sem(task.sid)
+            async with gate:
+                async with sgate:
                     task.state = "running"
                     task.started_at = time.time()
                     try:
@@ -2131,8 +2137,10 @@ class SubAgentPlugin(BasePlugin):
         if caller is not None and caller.tier == "coordinator":
             if t.parent_task_id != caller.task_id:
                 return f"错误: 任务 '{task_id}' 不是你派出的下级。"
-            t.collected = True  # 明确放弃：不再阻塞协调者收尾
+        if not self._stop_task(t):
             return f"任务 '{task_id}' 当前状态为 {t.state}，无法停止。"
+        if caller is not None and caller.tier == "coordinator":
+            t.collected = True  # 明确放弃：不再阻塞协调者收尾
         progress = f"已停止任务 {task_id}（{t.name}），停在第 {t.current_step}/{t.max_steps} 步。最近: {t.last_step_summary or '—'}"
         if self.allow_resume:
             progress += "。可用 resume_subagent 让它继续。"
@@ -2219,10 +2227,15 @@ class SubAgentPlugin(BasePlugin):
                 await self._cmd_stop(event, text[len(alias):].strip())
                 return
 
-        # 继续命令：/resumesuba <任务ID> [追加指示]
+        # 继续命令：/resumesuba <任务ID|序号> [新指示]（序号可紧贴命令：/resumesuba1 xxx）
         for alias in self.cmd_resume_aliases:
-            if text.startswith(alias + " ") or text == alias:
+            if text == alias or text.startswith(alias + " "):
                 await self._cmd_resume(event, text[len(alias):].strip())
+                return
+            m = re.match(rf"^{re.escape(alias)}(\d+)(?:\s+(.*))?$", text, re.S)
+            if m:
+                rest = m.group(1) + (" " + m.group(2) if m.group(2) else "")
+                await self._cmd_resume(event, rest)
                 return
 
         # 启动命令：/suba1 <任务内容>（序号对应默认子代理列表顺序）
@@ -2322,21 +2335,48 @@ class SubAgentPlugin(BasePlugin):
             event.stop()
 
     async def _cmd_resume(self, event: KiraMessageEvent, arg: str):
+        """/resumesuba <任务ID|序号> [新指示]
+        序号 = 列表序号（协调者开启时对应协调者列表，否则对应普通子代理列表），
+        自动找该子代理在本会话最近一个已结束且现场未过期的任务继续。"""
         if not self.allow_resume:
             await self._cmd_reply(event, "当前配置不允许恢复子代理任务。")
             return
         parts = arg.split(maxsplit=1)
-        task_id = parts[0] if parts else ""
+        target = parts[0] if parts else ""
         instruction = parts[1] if len(parts) > 1 else ""
-        t = self._tasks.get(task_id)
-        if not t or t.sid != event.session.sid:
-            await self._cmd_reply(event, f"找不到任务 {task_id or '（未指定）'}。")
-            return
+        if target.isdigit():
+            # 序号模式：找该序号对应子代理的最近可继续任务
+            order = self._cmd_order()
+            idx = int(target)
+            if not order:
+                await self._cmd_reply(event, self.msg_no_default)
+                return
+            if not (1 <= idx <= len(order)):
+                await self._cmd_reply(event, self._fmt_tpl(self.msg_invalid_index,
+                    index=idx, list=self._default_list_text()))
+                return
+            said = order[idx - 1]
+            candidates = [x for x in self._tasks.values()
+                          if x.sid == event.session.sid and x.subagent_id == said
+                          and x.state not in ("queued", "running")]
+            candidates.sort(key=lambda x: x.finished_at or 0)
+            if not candidates:
+                await self._cmd_reply(
+                    event,
+                    f"「{self._configs[said].name}」当前没有可继续的任务。"
+                    f"（只有本会话内已结束、且现场还在保留期内的任务才能继续）")
+                return
+            t = candidates[-1]
+        else:
+            t = self._tasks.get(target)
+            if not t or t.sid != event.session.sid:
+                await self._cmd_reply(event, f"找不到任务 {target or '（未指定）'}。")
+                return
         if t.state in ("queued", "running"):
-            await self._cmd_reply(event, f"任务 {task_id} 正在运行中。")
+            await self._cmd_reply(event, f"任务 {t.task_id} 正在运行中。")
             return
         if t.request is None or t.llm_model is None:
-            await self._cmd_reply(event, f"任务 {task_id} 的执行现场已不可用，无法恢复。")
+            await self._cmd_reply(event, f"任务 {t.task_id} 的执行现场已不可用，无法恢复。")
             return
         cfg = self._configs.get(t.subagent_id)
         if not cfg:
@@ -2348,4 +2388,4 @@ class SubAgentPlugin(BasePlugin):
         t.max_steps = self._effective_steps(cfg)
         t.error = ""
         t.handle = asyncio.create_task(self._task_runner(t, cfg, resume=True))
-        await self._cmd_reply(event, f"已让子代理「{t.name}」（任务 {task_id}）继续工作，完成后我会告诉你。")
+        await self._cmd_reply(event, f"已让子代理「{t.name}」（任务 {t.task_id}）继续工作，完成后我会告诉你。")

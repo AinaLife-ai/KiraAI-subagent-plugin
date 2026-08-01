@@ -669,11 +669,11 @@
           "/resumesuba",
           "/继续子代理"
         ],
-        "hint": "Resume a stopped task: /resumesuba <task_id> [extra instruction]",
+        "hint": "Resume by task ID OR list index (with coordinator enabled the index maps to the coordinator list, resuming its most recent finished task with retained context): /resumesuba <task_id|index> [new instruction]",
         "locales": {
           "zh": {
             "name": "继续命令别名",
-            "hint": "继续已停止任务：/resumesuba 任务ID [追加指示]"
+            "hint": "让任务带着保留的上下文接着做：/resumesuba 任务ID或序号 [新指示]。启用协调者时序号对应协调者列表，自动继续该协调者最近完成的任务"
           }
         }
       },
