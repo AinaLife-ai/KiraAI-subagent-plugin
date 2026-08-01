@@ -1418,11 +1418,19 @@ class SubAgentPlugin(BasePlugin):
     def _purge_coordinator_spawned(self, task: SubAgentTask):
         """协调者任务结束时回收它创建的内存级下级：
         不回收的话 _configs 会随运行时间无限增长，且后续协调者的
-        list_subagents 会被一堆过期下级刷屏（浪费 token、容易误派）。"""
-        for said in self._coordinator_spawned_by.pop(task.task_id, set()):
-            self._coordinator_spawned.discard(said)
-            self._configs.pop(said, None)
-            self._dbg("回收协调者 %s 的内存级下级 %s", task.task_id, said)
+        list_subagents 会被一堆过期下级刷屏（浪费 token、容易误派）。
+        已保存（持久化）的下级不回收，归属记录也保留——resume 续跑时仍可编辑它们。"""
+        owned = self._coordinator_spawned_by.get(task.task_id)
+        if not owned:
+            return
+        for said in list(owned):
+            if said in self._coordinator_spawned:  # 只回收内存级
+                self._coordinator_spawned.discard(said)
+                self._configs.pop(said, None)
+                owned.discard(said)
+                self._dbg("回收协调者 %s 的内存级下级 %s", task.task_id, said)
+        if not owned:
+            self._coordinator_spawned_by.pop(task.task_id, None)
 
     def _cancel_children(self, task: SubAgentTask):
         """防烂尾规则2：协调者结束（完成/停止/超时/出错）时级联取消其仍在跑的下级。"""
@@ -1760,11 +1768,12 @@ class SubAgentPlugin(BasePlugin):
             timeout=min(max(float(timeout), 0.0), 3600.0), model=model,  # LLM 传参硬钳制
         )
         self._configs[subagent_id] = cfg
+        if by_coordinator:
+            # 归属记录（内存级与已保存的都记）：编辑权限按"是不是我这个任务创建的"判定
+            self._coordinator_spawned_by.setdefault(caller.task_id, set()).add(subagent_id)
         if by_coordinator and not self.coordinator_save_spawned:
             # 内存级下级：不进 store、不进命令序号，重启即消失
             self._coordinator_spawned.add(subagent_id)
-            if caller is not None:
-                self._coordinator_spawned_by.setdefault(caller.task_id, set()).add(subagent_id)
             sub_logger.info(f"Coordinator spawned in-memory sub-agent: {subagent_id} ({name})")
             return f"子代理 '{subagent_id}' ({name}) 注册成功（协调者创建，仅本次运行有效，未持久化）！"
         self._persist_saved(cfg)  # 持久化，重启不丢
@@ -1859,9 +1868,10 @@ class SubAgentPlugin(BasePlugin):
             return (f"错误: '{subagent_id}' 是协调者，不可通过工具修改"
                     f"（请在插件设置 coordinator_personas 或 webui 人设界面调整）。")
         caller = _CURRENT_TASK.get(None)
-        if caller is not None and caller.tier == "coordinator" and config.source != "coordinator":
-            # 协调者只能改自己创建的下级（source=coordinator，含内存级与已保存的）；
-            # 内置/用户人设/主AI创建的不归它管（改那些会写 override 持久化，越权）
+        owned = self._coordinator_spawned_by.get(caller.task_id, set()) if caller is not None else set()
+        if caller is not None and caller.tier == "coordinator" and subagent_id not in owned:
+            # 协调者只能改【自己这个任务】创建的下级（含内存级与已保存的）；
+            # 内置/用户人设/主AI创建的、以及【其他协调者】创建的都不归它管
             return (f"错误: 你只能修改自己创建的下级子代理，"
                     f"'{subagent_id}' 是{_source_label(config.source)}子代理，不归你管。")
         if config.source == "builtin" and persona is not None:
@@ -2123,9 +2133,12 @@ class SubAgentPlugin(BasePlugin):
     async def subagent_status(self, event, task_id: str = "") -> str:
         if not self._in_scope(event.sid):
             return "当前会话未启用子代理功能。"
-        # 防呆循环：限制最小连续查询间隔
+        # 防呆循环：限制最小连续查询间隔。
+        # 协调者与主 LLM 共用会话 sid，按调用者分别限流，互不挤占额度
+        caller = _CURRENT_TASK.get(None)
+        rl_key = f"{event.sid}#{caller.task_id}" if caller is not None else event.sid
         now = time.time()
-        last = self._last_status_query.get(event.sid, 0.0)
+        last = self._last_status_query.get(rl_key, 0.0)
         if self.status_query_interval > 0 and now - last < self.status_query_interval:
             remain = int(self.status_query_interval - (now - last))
             active = [t for t in self._tasks.values() if t.state in ("queued", "running")]
@@ -2134,7 +2147,7 @@ class SubAgentPlugin(BasePlugin):
             return (f"查询过于频繁：最小查询间隔为 {int(self.status_query_interval)} 秒，"
                     f"请约 {remain} 秒后再查。任务完成后会主动通知你，无需反复查询。\n"
                     f"当前概况: {brief}")
-        self._last_status_query[event.sid] = now
+        self._last_status_query[rl_key] = now
         if not task_id:
             if not self._tasks:
                 return "当前没有任何子代理任务记录。"
