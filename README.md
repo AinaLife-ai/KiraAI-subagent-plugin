@@ -1,4 +1,4 @@
-# SubAgent — 子代理插件 v1.1.0
+# SubAgent — 子代理插件 v1.1.1
 
 让你的 AI 可以把活"外包"给一群专业小助手（子代理）：代码专家、写作专家，或你自己定义的任何角色。它们有自己的人格、工具、模型，在后台默默干活，干完了你的 AI 会主动跟你汇报——**全程不会卡住正常聊天**。
 
@@ -281,7 +281,11 @@ siliconflow;Qwen/Qwen2.5-7B-Instruct;快速通用
 ## 更新日志
 
 <details>
-<summary>展开查看更新日志（当前版本：v1.1.0）</summary>
+<summary>展开查看更新日志（当前版本：v1.1.1）</summary>
+
+### v1.1.1（适配新版工具管理）
+
+- 🔧 **适配 `ctx.tool_mgr`**：`ctx.llm_api.build_tool_set()` 与 `_SubagentLLMShim(ctx.llm_api, ...)` 改为 `ctx.tool_mgr`（KiraAI 新版 `llm_api` 已废弃，工具统一由 `tool_mgr` 管理），修复子代理工具集构建与超时控制失效问题
 
 ### v1.1.0（协调者层）
 
