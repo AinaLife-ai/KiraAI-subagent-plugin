@@ -1022,7 +1022,7 @@ class SubAgentPlugin(BasePlugin):
         return proxy_cls()
 
     def _build_tool_set(self, cfg: SubAgentConfig) -> ToolSet:
-        full_set = self.ctx.llm_api.build_tool_set()
+        full_set = self.ctx.tool_mgr.build_tool_set()
         tool_set = ToolSet()
         for tool in full_set.tools:
             if not self._sub_tool_allowed(tool.name, cfg):
@@ -1252,7 +1252,7 @@ class SubAgentPlugin(BasePlugin):
                                 resume: bool = False, _abandon_retries: int = 0) -> str:
         tool_set = self._build_tool_set(cfg)
         executor = AgentExecutor(
-            _SubagentLLMShim(self.ctx.llm_api, self.sub_tool_timeout), tool_set)
+            _SubagentLLMShim(self.ctx.tool_mgr, self.sub_tool_timeout), tool_set)
 
         if resume and task.request is not None:
             request = task.request
