@@ -1,42 +1,75 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="100%" height="100%">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#1e1b4b"/>
-      <stop offset="1" stop-color="#312e81"/>
+      <stop offset="0" stop-color="#0d0a24"/>
+      <stop offset="1" stop-color="#231a4d"/>
     </linearGradient>
     <linearGradient id="core" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#818cf8"/>
-      <stop offset="1" stop-color="#a78bfa"/>
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.55" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#c026d3"/>
     </linearGradient>
-    <linearGradient id="sat" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#67e8f9"/>
-      <stop offset="1" stop-color="#c4b5fd"/>
+    <linearGradient id="link" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#e879f9"/>
     </linearGradient>
-    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
-      <feGaussianBlur stdDeviation="1.2" result="blur"/>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="1.4" result="b"/>
       <feMerge>
-        <feMergeNode in="blur"/>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="halo" x="-120%" y="-120%" width="340%" height="340%">
+      <feGaussianBlur stdDeviation="3.2" result="h"/>
+      <feMerge>
+        <feMergeNode in="h"/>
         <feMergeNode in="SourceGraphic"/>
       </feMerge>
     </filter>
   </defs>
 
-  <rect width="64" height="64" rx="14" fill="url(#bg)" stroke="#6366f1" stroke-width="1.5"/>
+  <rect width="64" height="64" rx="16" fill="url(#bg)" stroke="#5b21b6" stroke-opacity="0.7" stroke-width="1.2"/>
 
-  <g filter="url(#glow)">
-    <rect x="24" y="22" width="16" height="18" rx="4" fill="url(#core)"/>
-    <rect x="31" y="17" width="6" height="5" rx="2" fill="#a78bfa"/>
-    <circle cx="34" cy="15" r="2.5" fill="#c4b5fd"/>
-    <rect x="28" y="27" width="3.5" height="4" rx="1.5" fill="#1e1b4b"/>
-    <rect x="32.5" y="27" width="3.5" height="4" rx="1.5" fill="#1e1b4b"/>
-    <rect x="29.5" y="35" width="5" height="2" rx="1" fill="#6366f1"/>
+  <!-- 背景星光点阵 -->
+  <circle cx="9" cy="25" r="1" fill="#818cf8" opacity="0.6"/>
+  <circle cx="55" cy="42" r="1" fill="#22d3ee" opacity="0.55"/>
+  <circle cx="15" cy="50" r="0.9" fill="#e879f9" opacity="0.5"/>
+  <circle cx="49" cy="10" r="0.9" fill="#818cf8" opacity="0.5"/>
+  <circle cx="24" cy="8" r="0.7" fill="#22d3ee" opacity="0.45"/>
+
+  <!-- 派发轨道：虚线环 -->
+  <circle cx="32" cy="32" r="18.5" fill="none" stroke="#818cf8" stroke-opacity="0.3" stroke-width="1" stroke-dasharray="2.5 3.5"/>
+
+  <!-- 三条派发连线（核心 → 子节点） -->
+  <g stroke="url(#link)" stroke-width="1.6" stroke-linecap="round" fill="none" opacity="0.9">
+    <path d="M 24.5 22.5 C 21 17, 16 16, 14 16"/>
+    <path d="M 39.5 22.5 C 43 17, 48 16, 50 16"/>
+    <path d="M 32 40.5 C 32 46, 32 48, 32 51.5"/>
   </g>
 
-  <circle cx="11" cy="18" r="4.5" fill="url(#sat)" filter="url(#glow)"/>
-  <circle cx="53" cy="18" r="4.5" fill="url(#sat)" filter="url(#glow)"/>
-  <circle cx="32" cy="53" r="4.5" fill="url(#sat)" filter="url(#glow)"/>
+  <!-- 线路上奔跑的数据粒子 -->
+  <circle cx="18.5" cy="18" r="1.5" fill="#22d3ee" filter="url(#glow)"/>
+  <circle cx="45.5" cy="18" r="1.5" fill="#22d3ee" filter="url(#glow)"/>
+  <circle cx="32" cy="46" r="1.5" fill="#22d3ee" filter="url(#glow)"/>
 
-  <line x1="15" y1="21" x2="28" y2="30" stroke="#818cf8" stroke-width="1.6" stroke-linecap="round"/>
-  <line x1="49" y1="21" x2="36" y2="30" stroke="#818cf8" stroke-width="1.6" stroke-linecap="round"/>
-  <line x1="32" y1="48.5" x2="32" y2="41" stroke="#818cf8" stroke-width="1.6" stroke-linecap="round"/>
+  <!-- 核心：发光六边形 -->
+  <g filter="url(#halo)">
+    <polygon points="32,21 41.5,26.5 41.5,37.5 32,43 22.5,37.5 22.5,26.5"
+             fill="url(#core)" stroke="#e0e7ff" stroke-opacity="0.9" stroke-width="1.2"/>
+    <rect x="28.7" y="29.4" width="3.1" height="3.2" rx="0.9" fill="#ffffff" opacity="0.95"/>
+    <rect x="33.2" y="29.4" width="3.1" height="3.2" rx="0.9" fill="#ffffff" opacity="0.7"/>
+    <rect x="28.7" y="33.8" width="3.1" height="3.2" rx="0.9" fill="#ffffff" opacity="0.7"/>
+    <rect x="33.2" y="33.8" width="3.1" height="3.2" rx="0.9" fill="#ffffff" opacity="0.95"/>
+  </g>
+
+  <!-- 三个子代理节点 -->
+  <g filter="url(#halo)">
+    <circle cx="14" cy="16" r="4.5" fill="url(#core)"/>
+    <circle cx="50" cy="16" r="4.5" fill="url(#core)"/>
+    <circle cx="32" cy="52" r="4.5" fill="url(#core)"/>
+  </g>
+  <circle cx="14" cy="16" r="1.5" fill="#ffffff" opacity="0.95"/>
+  <circle cx="50" cy="16" r="1.5" fill="#ffffff" opacity="0.95"/>
+  <circle cx="32" cy="52" r="1.5" fill="#ffffff" opacity="0.95"/>
 </svg>
