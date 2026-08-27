@@ -950,9 +950,68 @@ class SubAgentPlugin(BasePlugin):
             pass
         return "（无法识别，请到 webui 模型配置里查看）"
 
+    def _resolve_provider_inst(self, provider_key: str, model_id: str):
+        """把服务商标识解析成真实 provider 实例 ID（UUID）。
+
+        用户配置里只能也只会填人类可读的服务商显示名（如 ``Agnes（CN）``），
+        而 KiraAI 的 ``get_llm_client`` 需要的是实例 UUID（如 ``31f447c5e3e3``）。
+        这里自动完成映射，用户无需也无法手工抄 UUID：
+        1. 直查：填的本来就是 UUID/实例 ID（老配置兼容）；
+        2. 显示名精确匹配；
+        3. 归一化（去空白）后精确匹配；
+        4. 包含匹配（多候选取名字最短的，避免「小鸡」「小鸡（按量3）」误配）。
+        每步都校验目标实例的 LLM 模型列表里确实存在该模型。
+        返回 (provider_id | None, error_msg | None)。"""
+        try:
+            pm = self.ctx.provider_mgr
+        except Exception as e:
+            sub_logger.error(f"[subagent] 无法访问 provider 管理器: {e}")
+            return None, "无法访问模型管理器，请检查框架状态"
+        if not provider_key:
+            return None, "提供商为空"
+        # 1) 直查：填的已是真实实例 ID（UUID）
+        inst = pm.get_provider(provider_key)
+        if inst is not None:
+            if pm.get_model_info(provider_key, model_id, "llm") is not None:
+                return provider_key, None
+            return None, f"模型 {model_id} 不在服务商 {provider_key} 的 LLM 模型列表里（请到 webui 模型配置确认）"
+        # 2) 显示名匹配：精确 → 去空白精确 → 包含（候选按得分+名字长度排序，最短者胜出）
+        key_norm = re.sub(r"\s+", "", provider_key)
+        cands = []
+        try:
+            providers = pm.get_all_providers()
+        except Exception:
+            providers = {}
+        for pid, prov in providers.items():
+            name = getattr(prov, "provider_name", "") or ""
+            if not name:
+                continue
+            if name == provider_key:
+                score = 0
+            else:
+                name_norm = re.sub(r"\s+", "", name)
+                if name_norm == key_norm:
+                    score = 1
+                elif key_norm and (key_norm in name_norm or name_norm in key_norm):
+                    score = 2
+                else:
+                    continue
+            if pm.get_model_info(pid, model_id, "llm") is not None:
+                cands.append((score, len(name), pid))
+        if cands:
+            cands.sort(key=lambda x: (x[0], x[1]))
+            return cands[0][2], None
+        names = "、".join(sorted({
+            (getattr(p, "provider_name", "") or "") for p in providers.values()
+            if getattr(p, "provider_name", "")
+        }))
+        return None, (f"找不到服务商「{provider_key}」（或其下没有模型 {model_id}）。"
+                      f"请到 webui 模型配置里填写显示名，当前已注册: {names or '（无）'}")
+
     def _resolve_model(self, model_str: str, tier: str = "normal"):
         """返回 (LLMModelClient | None, error_msg | None)。
-        协调者优先用独立的 coordinator_models（未填则回退 available_models）。"""
+        协调者优先用独立的 coordinator_models（未填则回退 available_models）。
+        服务商支持 webui 显示名（自动解析成真实实例 UUID）或实例 UUID，两种都认。"""
         entries = self.coordinator_models if (tier == "coordinator" and self.coordinator_models) else self.available_models
         if not model_str:
             if not entries:
@@ -965,12 +1024,21 @@ class SubAgentPlugin(BasePlugin):
                 return (client, None) if client else (None, "未配置快速模型")
             return None, (f"可选模型列表已填写，'fast' 不再可用。如需使用快速模型，"
                           f"请在 available_models 中按同格式手动添加一行：{self._fast_model_label()};擅长提示")
-        provider_id, _, model_id = model_str.partition(":")
-        if entries and not any(m["provider"] == provider_id and m["model"] == model_id for m in entries):
-            return None, f"模型 {model_str} 不在可选列表中。可选: {self._models_hint_text(tier)}"
-        client = self.ctx.get_llm_client(model_uuid=model_str)
+        provider_key, _, model_id = model_str.partition(":")
+        if not provider_key or not model_id:
+            return None, f"模型格式错误：{model_str}（需要 提供商;模型 或 提供商:模型）"
+        # 显示名 → 真实实例 UUID（核心修复：旧版直接拿显示名查 get_llm_client 必然失败）
+        real_pid, err = self._resolve_provider_inst(provider_key, model_id)
+        if err:
+            return None, err
+        # 白名单校验：显示名与真实 UUID 命中其一即可（兼容填 UUID 的旧配置）
+        if entries and not any(
+                m["model"] == model_id and (m["provider"] == provider_key or m["provider"] == real_pid)
+                for m in entries):
+            return None, f"模型 {provider_key}:{model_id} 不在可选列表中。可选: {self._models_hint_text(tier)}"
+        client = self.ctx.get_llm_client(model_uuid=f"{real_pid}:{model_id}")
         if not client:
-            return None, f"无法获取模型 {model_str}（提供商未注册或模型不存在）"
+            return None, f"无法获取模型 {provider_key}:{model_id}（服务商 {real_pid} 未注册或模型不存在）"
         return client, None
 
     def _name_in(self, name: str, patterns: list[str]) -> bool:
