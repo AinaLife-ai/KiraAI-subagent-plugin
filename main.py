@@ -263,7 +263,12 @@ class _SubagentLLMShim:
         # 0 = 跟随框架：直接走原实现（含 webui 工具调用超时）
         if self._tool_timeout <= 0:
             return await self._inner.execute_tool(event, resp, tool_set=tool_set)
-        from core.plugin.plugin_handlers import event_handler_reg, EventType
+        try:
+            # 3.0+：注册表在 core.plugin.handlers
+            from core.plugin.handlers import event_handler_reg, EventType
+        except ImportError:
+            # 2.x：旧单模块路径
+            from core.plugin.plugin_handlers import event_handler_reg, EventType
         timeout = self._tool_timeout
         tool_logger = logging.getLogger("tool_use")
         for tool_call in resp.tool_calls:
@@ -943,12 +948,29 @@ class SubAgentPlugin(BasePlugin):
             m = getattr(client, "model", None)
             if m is not None:
                 provider = getattr(m, "provider_name", "") or getattr(m, "provider_id", "")
+                # 注意：本标签会被用户原样粘贴进 available_models 配置，
+                # 3.0 起配置值必须是内部稳定 ID（model_id），可读名不能用于拼接引用。
                 model_id = getattr(m, "model_id", "")
                 if provider and model_id:
                     return f"{provider};{model_id}"
         except Exception:
             pass
         return "（无法识别，请到 webui 模型配置里查看）"
+
+    def _fast_model_display(self) -> str:
+        """给人看的快速模型展示：优先可读名（3.0 的 model_name），附可粘贴的标识。"""
+        try:
+            client = self.ctx.get_default_fast_llm_client()
+            m = getattr(client, "model", None)
+            if m is not None:
+                name = getattr(m, "model_name", None) or ""
+                ident = self._fast_model_label()
+                if name and not ident.startswith("（"):
+                    return f"{name}（标识 {ident}）"
+                return ident
+        except Exception:
+            pass
+        return self._fast_model_label()
 
     def _resolve_model(self, model_str: str, tier: str = "normal"):
         """返回 (LLMModelClient | None, error_msg | None)。
