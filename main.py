@@ -263,7 +263,12 @@ class _SubagentLLMShim:
         # 0 = 跟随框架：直接走原实现（含 webui 工具调用超时）
         if self._tool_timeout <= 0:
             return await self._inner.execute_tool(event, resp, tool_set=tool_set)
-        from core.plugin.plugin_handlers import event_handler_reg, EventType
+        try:
+            # 3.0+：注册表已拆分到 core.plugin.handlers
+            from core.plugin.handlers import event_handler_reg, EventType
+        except ImportError:
+            # 2.x：旧单模块路径
+            from core.plugin.plugin_handlers import event_handler_reg, EventType
         timeout = self._tool_timeout
         tool_logger = logging.getLogger("tool_use")
         for tool_call in resp.tool_calls:
@@ -950,6 +955,44 @@ class SubAgentPlugin(BasePlugin):
             pass
         return "（无法识别，请到 webui 模型配置里查看）"
 
+    def _fast_model_display(self) -> str:
+        """给人看的快速模型展示：优先可读名（3.0 的 model_name），附可粘贴的标识。"""
+        try:
+            client = self.ctx.get_default_fast_llm_client()
+            m = getattr(client, "model", None)
+            if m is not None:
+                name = getattr(m, "model_name", None) or ""
+                ident = self._fast_model_label()
+                if name and not ident.startswith("（"):
+                    return f"{name}（标识 {ident}）"
+                return ident
+        except Exception:
+            pass
+        return self._fast_model_label()
+
+    def _resolve_model_ref(self, model_id: str) -> str:
+        """3.0 兼容：把按 2.x 习惯填写的「可读模型名」反查成内部稳定 ID。
+
+        3.0 起模型引用值必须是内部 model_id（uuid 形态），可读名在 ``model_name``；
+        新建模型没有 legacy_ids，可读名直传 ``get_llm_client`` / ``get_model_info``
+        都解析不到（框架 ``resolve_model_entry`` 只认内部 ID 与 legacy 别名）。
+        这里跨全部服务商按 ``model_name`` 精确反查；2.x 的 ModelInfo 不含该属性
+        ⇒ 永不命中、原样返回，行为逐字不变。
+        """
+        try:
+            pm = getattr(self.ctx, "provider_mgr", None)
+            if pm is None or not model_id:
+                return model_id
+            for pid in (pm.get_all_providers() or {}):
+                for mi in (pm.get_model_infos(pid) or []):
+                    if getattr(mi, "model_name", None) == model_id:
+                        mid = getattr(mi, "model_id", "") or ""
+                        if mid and mid != model_id:
+                            return mid
+        except Exception:
+            pass
+        return model_id
+
     def _resolve_provider_inst(self, provider_key: str, model_id: str):
         """把服务商标识解析成真实 provider 实例 ID（UUID）。
 
@@ -1023,12 +1066,17 @@ class SubAgentPlugin(BasePlugin):
                 client = self.ctx.get_default_fast_llm_client()
                 return (client, None) if client else (None, "未配置快速模型")
             return None, (f"可选模型列表已填写，'fast' 不再可用。如需使用快速模型，"
-                          f"请在 available_models 中按同格式手动添加一行：{self._fast_model_label()};擅长提示")
+                          f"请在 available_models 中按同格式手动添加一行：{self._fast_model_display()};擅长提示")
         provider_key, _, model_id = model_str.partition(":")
         if not provider_key or not model_id:
             return None, f"模型格式错误：{model_str}（需要 提供商;模型 或 提供商:模型）"
+        # 3.0 兼容：可读模型名 → 内部稳定 ID（2.x 上原名即 ID，原样返回）
+        model_ident = self._resolve_model_ref(model_id)
         # 显示名 → 真实实例 UUID（核心修复：旧版直接拿显示名查 get_llm_client 必然失败）
-        real_pid, err = self._resolve_provider_inst(provider_key, model_id)
+        real_pid, err = self._resolve_provider_inst(provider_key, model_ident)
+        if err and model_ident != model_id:
+            # 反查结果不被服务商接受时，退回用户原文再试（报错信息仍按用户填写的值）
+            real_pid, err = self._resolve_provider_inst(provider_key, model_id)
         if err:
             return None, err
         # 白名单校验：显示名与真实 UUID 命中其一即可（兼容填 UUID 的旧配置）
@@ -1036,7 +1084,9 @@ class SubAgentPlugin(BasePlugin):
                 m["model"] == model_id and (m["provider"] == provider_key or m["provider"] == real_pid)
                 for m in entries):
             return None, f"模型 {provider_key}:{model_id} 不在可选列表中。可选: {self._models_hint_text(tier)}"
-        client = self.ctx.get_llm_client(model_uuid=f"{real_pid}:{model_id}")
+        client = self.ctx.get_llm_client(model_uuid=f"{real_pid}:{model_ident}")
+        if not client and model_ident != model_id:
+            client = self.ctx.get_llm_client(model_uuid=f"{real_pid}:{model_id}")
         if not client:
             return None, f"无法获取模型 {provider_key}:{model_id}（服务商 {real_pid} 未注册或模型不存在）"
         return client, None
