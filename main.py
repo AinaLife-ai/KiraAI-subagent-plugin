@@ -970,20 +970,38 @@ class SubAgentPlugin(BasePlugin):
             pass
         return self._fast_model_label()
 
-    def _resolve_model_ref(self, model_id: str) -> str:
+    def _resolve_model_ref(self, provider_key: str, model_id: str) -> str:
         """3.0 兼容：把按 2.x 习惯填写的「可读模型名」反查成内部稳定 ID。
 
         3.0 起模型引用值必须是内部 model_id（uuid 形态），可读名在 ``model_name``；
         新建模型没有 legacy_ids，可读名直传 ``get_llm_client`` / ``get_model_info``
         都解析不到（框架 ``resolve_model_entry`` 只认内部 ID 与 legacy 别名）。
-        这里跨全部服务商按 ``model_name`` 精确反查；2.x 的 ModelInfo 不含该属性
-        ⇒ 永不命中、原样返回，行为逐字不变。
+
+        解析顺序：**先在用户填写的服务商下反查**（服务商可填实例 ID 或 webui 显示名，
+        与 v1.1.2 的显示名解析同一套判据），命中即返回——多个服务商存在同名模型时
+        不会串台；该服务商下找不到才跨全部服务商兜底。2.x 的 ModelInfo 不含
+        ``model_name`` ⇒ 永不命中、原样返回，行为逐字不变。
         """
         try:
             pm = getattr(self.ctx, "provider_mgr", None)
             if pm is None or not model_id:
                 return model_id
-            for pid in (pm.get_all_providers() or {}):
+            providers = pm.get_all_providers() or {}
+            # 1) 先定位用户填写的服务商（实例 ID / 显示名精确 / 去空白显示名）
+            target = None
+            key_norm = re.sub(r"\s+", "", provider_key or "")
+            for pid, prov in providers.items():
+                if pid == provider_key:
+                    target = pid
+                    break
+                name = getattr(prov, "provider_name", "") or ""
+                if not name:
+                    continue
+                if name == provider_key or (key_norm and re.sub(r"\s+", "", name) == key_norm):
+                    target = pid
+                    break
+            order = ([target] if target else []) + [p for p in providers if p != target]
+            for pid in order:
                 for mi in (pm.get_model_infos(pid) or []):
                     if getattr(mi, "model_name", None) == model_id:
                         mid = getattr(mi, "model_id", "") or ""
@@ -1071,7 +1089,7 @@ class SubAgentPlugin(BasePlugin):
         if not provider_key or not model_id:
             return None, f"模型格式错误：{model_str}（需要 提供商;模型 或 提供商:模型）"
         # 3.0 兼容：可读模型名 → 内部稳定 ID（2.x 上原名即 ID，原样返回）
-        model_ident = self._resolve_model_ref(model_id)
+        model_ident = self._resolve_model_ref(provider_key, model_id)
         # 显示名 → 真实实例 UUID（核心修复：旧版直接拿显示名查 get_llm_client 必然失败）
         real_pid, err = self._resolve_provider_inst(provider_key, model_ident)
         if err and model_ident != model_id:
