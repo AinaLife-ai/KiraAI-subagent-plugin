@@ -285,7 +285,17 @@ siliconflow;Qwen/Qwen2.5-7B-Instruct;快速通用
 ## 更新日志
 
 <details>
-<summary>展开查看更新日志（当前版本：v1.1.1）</summary>
+<summary>展开查看更新日志（当前版本：v1.1.3）</summary>
+
+### v1.1.3（available_models 可读名直填）
+
+- 🔧 **`available_models` 沿用 2.x 可读名写法**：用户按 2.x 习惯填「提供商;可读模型名」时，3.0 rc.1 的 `get_llm_client` 只认内部 ID / 迁移旧名，新模型可读名直传拿不到客户端。新增 `_resolve_display_ref`：直传失败时按 `model_name` 反查内部 ID 再试；2.x 直传即成功不进此分支，行为不变。
+
+### v1.1.2（3.0 兼容）
+
+- 🔧 **handlers 导入双形态化**：`execute_tool` 内裸导入的 `core.plugin.plugin_handlers` 在 3.0（v3.0.0-rc.1）已删除（拆分为 `core/plugin/handlers.py`），启用自定义工具超时即 ImportError；现优先新路径、`ImportError` 回退旧路径（2.x 不变）。
+- 🔧 **快速模型展示可读名**：「webui 快速模型」提示不再显示 3.0 内部 uuid——拆分为「粘贴值」（3.0 下仍为内部 ID）与「展示名」（优先 `model_name`），2.x 无 `model_name` 自动回退。
+- 📖 README 补兼容性声明与 3.0 下 `available_models` 填写指引。
 
 ### v1.1.1（适配新版工具管理）
 
