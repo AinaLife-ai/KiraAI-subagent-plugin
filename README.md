@@ -307,7 +307,14 @@ if is_stub:
 ## 更新日志
 
 <details>
-<summary>展开查看更新日志（当前版本：v1.1.2）</summary>
+<summary>展开查看更新日志（当前版本：v1.1.4）</summary>
+
+### v1.1.4（3.0 rc.1 兼容：工具超时导入链 + 可读模型名反查）
+
+- 🧩 **修复 3.0 上工具超时链路 ImportError**：`execute_tool` 内裸导入的 `core.plugin.plugin_handlers` 在 KiraAI v3.0.0-rc.1 已拆分删除（注册表迁到 `core.plugin.handlers`），开启自定义工具超时（`sub_tool_timeout > 0`）即 ImportError。现改候选链：优先 3.0 路径，`ImportError` 回退 2.x 旧路径（符号两代同名同语义，行为零变化）
+- 🐛 **修复 3.0 上「按 2.x 习惯填可读模型名」派不出子代理**：3.0 起模型引用值必须是内部稳定 ID（uuid 形态），可读名在 `model_name`；框架 `resolve_model_entry` 只认内部 ID / legacy 别名，新建模型没有 legacy_ids ⇒ 可读名解析不到。现新增 `_resolve_model_ref`：**先按用户填写的服务商定位**（实例 ID / 显示名，与 v1.1.2 同一套判据），在该服务商下按 `model_name` 精确反查内部 ID——多个服务商存在同名模型时不会串台；该服务商下找不到才跨全部服务商兜底。配置写法完全不变（服务商与模型都填 webui 里的可读名即可），2.x 不命中、原样返回
+- 📝 **「快速模型」提示词显示可读名**：新增 `_fast_model_display()`（优先 `model_name`，附可粘贴标识）；`_fast_model_label()` 仍返回可直接粘贴进配置的引用值。2.x 无 `model_name` 时自动回退
+- ✅ **双世代核实**：v2.34.8 与 v3.0.0-rc.1 两代框架的导入路径、模型解析路径均实测；全部走特征识别，不绑版本号
 
 ### v1.1.3（兼容性：桩事件显式标记）
 
