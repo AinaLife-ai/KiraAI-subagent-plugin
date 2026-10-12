@@ -972,6 +972,24 @@ class SubAgentPlugin(BasePlugin):
             pass
         return self._fast_model_label()
 
+    def _resolve_display_ref(self, provider_id: str, model_id: str) -> str:
+        """把用户按 2.x 习惯填的「提供商:可读名」解析成当前框架可用的引用。
+
+        3.0 起 get_llm_client 只按内部 ID / 迁移旧名（legacy_ids）解析；
+        3.0 新建的模型没有 legacy_ids，可读名直传会拿不到客户端 —— 这里按
+        model_name 反查内部 ID。2.x 上原名即 ID，直通返回，行为不变。
+        """
+        try:
+            pm = getattr(self.ctx, "provider_mgr", None)
+            if pm is None:
+                return f"{provider_id}:{model_id}"
+            for mi in pm.get_model_infos(provider_id) or []:
+                if getattr(mi, "model_name", None) == model_id and getattr(mi, "model_id", None):
+                    return f"{provider_id}:{mi.model_id}"
+        except Exception:
+            pass
+        return f"{provider_id}:{model_id}"
+
     def _resolve_model(self, model_str: str, tier: str = "normal"):
         """返回 (LLMModelClient | None, error_msg | None)。
         协调者优先用独立的 coordinator_models（未填则回退 available_models）。"""
@@ -991,6 +1009,11 @@ class SubAgentPlugin(BasePlugin):
         if entries and not any(m["provider"] == provider_id and m["model"] == model_id for m in entries):
             return None, f"模型 {model_str} 不在可选列表中。可选: {self._models_hint_text(tier)}"
         client = self.ctx.get_llm_client(model_uuid=model_str)
+        if not client:
+            # 3.0 兼容：直传失败时按可读名反查内部 ID 再试（2.x 直传即成功，不进此分支）
+            ref = self._resolve_display_ref(provider_id, model_id)
+            if ref != model_str:
+                client = self.ctx.get_llm_client(model_uuid=ref)
         if not client:
             return None, f"无法获取模型 {model_str}（提供商未注册或模型不存在）"
         return client, None
