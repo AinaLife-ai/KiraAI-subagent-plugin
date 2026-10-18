@@ -11,19 +11,21 @@
     },
     "fields": {
       "enabled_sessions": {
-        "type": "list",
+        "type": "multi_select",
+        "source": "session",
+        "allow_custom": true,
         "name": "Enabled Sessions",
         "default": [],
-        "hint": "Sessions where sub-agent features are enabled, format <adapter_name>:<gm/dm>:<session_id>. Empty = all sessions",
+        "hint": "Select sessions from the system list, or enter <adapter_name>:<gm/dm>:<session_id>. Empty = all sessions; order does not affect access",
         "locales": {
           "zh": {
             "name": "启用会话",
-            "hint": "启用子代理功能的会话名单，格式 <adapter>:<gm/dm>:<session_id>，留空=全部启用"
+            "hint": "从系统列表选择启用会话，也可手动输入 <adapter>:<gm/dm>:<session_id>；留空=全部启用，顺序不影响权限"
           }
         }
       },
       "call_mode": {
-        "type": "enum",
+        "type": "string",
         "name": "Call Mode",
         "default": "async",
         "options": [
@@ -39,7 +41,7 @@
         }
       },
       "result_delivery": {
-        "type": "enum",
+        "type": "string",
         "name": "Result Delivery",
         "default": "to_main_llm",
         "options": [
